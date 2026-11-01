@@ -97,6 +97,48 @@ async def scenario_broken_provider() -> None:
         await runner.cleanup()
 
 
+async def scenario_host_details() -> None:
+    """С токеном видно данные хоста: Telegram, режим, время старта."""
+    port = free_port()
+    host = {"telegram": "@ServMS_bot", "monitoring": "включён", "started_at": "01.11.2026 12:00:00"}
+    runner = await start_health_server(
+        port,
+        fake_status,
+        token=TOKEN,
+        extra_provider=lambda: host,
+    )
+    try:
+        status, payload = await get(port, "/health")
+        assert "host" not in payload, f"без токена данные хоста не отдаются: {payload}"
+
+        status, payload = await get(port, f"/health?token={TOKEN}")
+        assert status == 200
+        assert payload["host"]["telegram"] == "@ServMS_bot", f"нет данных Telegram: {payload}"
+        assert payload["host"]["monitoring"] == "включён"
+        assert payload["sd"]["seen_count"] == 25, "статус SD должен остаться"
+        print("  OK: с токеном видны Telegram и режим работы сервера")
+    finally:
+        await runner.cleanup()
+
+
+async def scenario_host_provider_broken() -> None:
+    """Падение поставщика данных хоста не ломает эндпоинт."""
+    port = free_port()
+
+    def broken() -> dict:
+        raise RuntimeError("нет данных")
+
+    runner = await start_health_server(port, fake_status, token=TOKEN, extra_provider=broken)
+    try:
+        status, payload = await get(port, f"/health?token={TOKEN}")
+        assert status == 200
+        assert payload["sd"]["seen_count"] == 25, "статус SD должен остаться"
+        assert payload.get("host_error") is True, f"нет отметки об ошибке хоста: {payload}"
+        print("  OK: ошибка данных хоста не роняет health")
+    finally:
+        await runner.cleanup()
+
+
 async def scenario_port_released() -> None:
     """После cleanup порт освобождается — важно при перезапусках на хостинге."""
     port = free_port()
@@ -115,7 +157,9 @@ async def main() -> None:
     for title, scenario in (
         ("[базовый ответ]", scenario_minimal),
         ("[доступ к деталям]", scenario_details_by_token),
+        ("[данные хоста]", scenario_host_details),
         ("[сломанный провайдер]", scenario_broken_provider),
+        ("[сломанный хоста]", scenario_host_provider_broken),
         ("[освобождение порта]", scenario_port_released),
     ):
         print(f"\n{title}")
