@@ -33,13 +33,16 @@ def _build_app(
     app = web.Application()
 
     # Статистика входящих запросов: по ней видно, кто и как часто будит сервис
-    # (UptimeRobot, GitHub Actions, браузер) — иначе проверить это снаружи нечем.
+    # (UptimeRobot, GitHub Actions, сам Render) — иначе проверить это снаружи нечем.
     stats: dict[str, Any] = {"count": 0, "last_at": None, "last_ua": None}
+    agents: dict[str, int] = {}
 
     async def handle(request: web.Request) -> web.Response:
         stats["count"] = int(stats["count"]) + 1
         stats["last_at"] = time.strftime("%d.%m.%Y %H:%M:%S", time.localtime())
         stats["last_ua"] = (request.headers.get("User-Agent") or "")[:120]
+        agent_key = stats["last_ua"] or "(без User-Agent)"
+        agents[agent_key] = agents.get(agent_key, 0) + 1
 
         payload: dict[str, Any] = {
             "status": "ok",
@@ -66,6 +69,9 @@ def _build_app(
                 host["pings"] = stats["count"]
                 host["last_ping"] = stats["last_at"]
                 host["last_user_agent"] = stats["last_ua"]
+                host["agents"] = dict(
+                    sorted(agents.items(), key=lambda item: item[1], reverse=True)[:5]
+                )
                 payload["host"] = host
 
         return web.json_response(payload)
