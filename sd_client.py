@@ -185,6 +185,20 @@ class SDRequest:
         """Как показывать заявку: код, если он есть, иначе REQ-номер."""
         return self.code or self.number
 
+    def format_short(self, index: int = 0) -> str:
+        """Компактная строка для списков (/sd_dump): код, статус, исполнитель, дата."""
+        name = html.escape(self.display_name)
+        link = html.escape(self.url)
+        prefix = f"{index}. " if index else ""
+        parts = [f'{prefix}<a href="{link}">{name}</a>']
+        if self.state:
+            parts.append(html.escape(self.state))
+        if self.assigned_user:
+            parts.append(html.escape(self.assigned_user))
+        if self.sys_created_at:
+            parts.append(html.escape(self.sys_created_at))
+        return " | ".join(parts)
+
     def __post_init__(self):
         # Хак: base_url не в dataclass, добавим через object.__setattr__
         pass
