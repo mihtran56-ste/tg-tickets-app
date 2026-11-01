@@ -124,6 +124,10 @@ Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullNam
 
 ## Деплой
 
+Сервис работает: **https://tg-tickets.onrender.com** (Render, free, Франкфурт).
+Проверка живости — /health. Подробности и грабли первого деплоя — в [DEPLOY.md](DEPLOY.md).
+
+
 См. [DEPLOY.md](DEPLOY.md). Коротко: `render.yaml` для Render (free web service),
 `Dockerfile` — для VPS/Amvera/HF Spaces.
 
