@@ -1,0 +1,18 @@
+# Секреты и локальные данные — никогда в репозиторий
+.env
+.env.*
+!.env.example
+data/
+res.txt
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Временные файлы
+.tmp*
+*.log
+logs/

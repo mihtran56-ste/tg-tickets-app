@@ -1,0 +1,4 @@
+# Нормализация переводов строк: в репозитории LF (Linux-хостинг),
+# .bat-файлы — CRLF (иначе не запустятся в Windows).
+* text=auto eol=lf
+*.bat text eol=crlf

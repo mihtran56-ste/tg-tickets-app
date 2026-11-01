@@ -1,0 +1,48 @@
+# Blueprint для Render (free web service).
+# Секреты помечены sync: false — их нужно вписать в панели Render,
+# в репозиторий они не попадают.
+
+services:
+  - type: web
+    name: tg-tickets
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.0"
+      - key: SD_ENABLED
+        value: "true"
+      - key: SD_BASE_URL
+        sync: false
+      - key: SD_VIEW
+        value: Default
+      - key: SD_CHECK_INTERVAL
+        value: "60"
+      - key: SD_SEED_ON_FIRST_RUN
+        value: "true"
+      - key: NOTIFY_ON_START
+        value: "false"
+      - key: NOTIFY_ON_STOP
+        value: "false"
+      # --- Секреты: заполнить в дашборде Render ---
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: SD_LOGIN
+        sync: false
+      - key: SD_PASSWORD
+        sync: false
+      - key: SD_CONDITION
+        sync: false
+      - key: SD_NOTIFY_CHAT_IDS
+        sync: false
+      - key: HEALTH_TOKEN
+        sync: false

@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Проверки (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Прогнать все тесты
+        run: |
+          set -e
+          for f in tests/test_*.py; do
+            echo "=== $f"
+            python "$f"
+            echo
+          done
+
+  # Dockerfile локально не проверить (Docker не установлен) — собираем в CI
+  docker:
+    name: Сборка Docker-образа
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Собрать образ
+        run: docker build -t tg-tickets:ci .
+
+      - name: Проверить, что образ запускается и видит настройки
+        run: |
+          docker run --rm tg-tickets:ci python -c "import config, bot, sd_client, health, notify; print('импорты в образе работают')"
