@@ -32,7 +32,15 @@ def _build_app(
 ) -> web.Application:
     app = web.Application()
 
+    # Статистика входящих запросов: по ней видно, кто и как часто будит сервис
+    # (UptimeRobot, GitHub Actions, браузер) — иначе проверить это снаружи нечем.
+    stats: dict[str, Any] = {"count": 0, "last_at": None, "last_ua": None}
+
     async def handle(request: web.Request) -> web.Response:
+        stats["count"] = int(stats["count"]) + 1
+        stats["last_at"] = time.strftime("%d.%m.%Y %H:%M:%S", time.localtime())
+        stats["last_ua"] = (request.headers.get("User-Agent") or "")[:120]
+
         payload: dict[str, Any] = {
             "status": "ok",
             "uptime_sec": int(time.time() - started_at),
@@ -50,10 +58,15 @@ def _build_app(
                     payload["sd_error"] = True
             if extra_provider is not None:
                 try:
-                    payload["host"] = extra_provider()
+                    host = dict(extra_provider())
                 except Exception:  # noqa: BLE001
                     log.exception("Не удалось получить данные о хосте")
                     payload["host_error"] = True
+                    host = {}
+                host["pings"] = stats["count"]
+                host["last_ping"] = stats["last_at"]
+                host["last_user_agent"] = stats["last_ua"]
+                payload["host"] = host
 
         return web.json_response(payload)
 
