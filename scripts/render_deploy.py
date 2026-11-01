@@ -76,13 +76,25 @@ def read_env_file(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         raise SystemExit(f"нет файла с переменными: {path}")
 
+    # На Render эти переменные задаёт платформа: PORT подставляет сам Render,
+    # а каталога /data (Docker-том) там нет — иначе сервис не поднимется.
+    skip = {"PORT", "DATA_DIR"}
+
     result: list[dict[str, str]] = []
+    skipped: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        result.append({"key": key.strip(), "value": value.strip()})
+        key = key.strip()
+        if key in skip:
+            skipped.append(key)
+            continue
+        result.append({"key": key, "value": value.strip()})
+
+    if skipped:
+        print(f"  пропущены платформенные переменные: {', '.join(sorted(skipped))}")
     return result
 
 
