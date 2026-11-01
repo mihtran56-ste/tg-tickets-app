@@ -41,7 +41,7 @@ RAW_ITEM = {
     },
     "multicard_name_client": {"value": "produkty", "color": ""},
     "multicard_pos": {"value": "82251125906536", "color": ""},
-    "multicard_terminal_address": {"value": "603000, г. Пример, ул. Тестовая, 1"},
+    "multicard_terminal_address": {"value": "603124,Нижний Новгород,пер Камчатский, 7"},
     "multicard_deadline": {"value": "2026-11-01 10:40:53"},
     "multicard_comment_ing": {"value": ""},
     "hold_code": {"value": ""},
@@ -107,7 +107,7 @@ def scenario_notification() -> None:
     assert "<b>Статус:</b> В работе" in text, f"статус не человеческий:\n{text}"
     assert "<b>Планирование:</b> Запланирована" in text, f"планирование не человеческое:\n{text}"
     assert "31.10.2026 14:29" in text, f"дата не отформатирована:\n{text}"
-    assert 'href="https://sd.example.ru/nav_to.do' in text, "ссылка на заявку потерялась"
+    assert 'href="https://sd.example.ru/record/itsm_request/' in text, "ссылка должна вести на /record/"
     print("  OK: заголовок — только код SUTSPROD, без REQ")
 
 
