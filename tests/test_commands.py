@@ -88,12 +88,14 @@ class FakeWatcher:
 class FakeClient:
     """Считает обращения, чтобы проверить переиспользование сессии."""
 
-    def __init__(self) -> None:
+    def __init__(self, items: list | None = None, total: int = 23) -> None:
         self.calls = 0
+        self._items = items or []
+        self._total = total
 
     async def fetch_requests(self, view: str, condition: str, limit: int = 100):
         self.calls += 1
-        return [], 23
+        return list(self._items), self._total
 
 
 def make_cfg(enabled: bool = True, allowed: frozenset[int] = frozenset({1001})) -> Config:
@@ -236,6 +238,75 @@ async def scenario_count_reuses_session() -> None:
     print("  OK: /sd_count переиспользует сессию монитора")
 
 
+async def scenario_dump_sends_all() -> None:
+    """/sd_dump присылает все заявки списком, длинный список режется по лимиту."""
+    from sd_client import SDRequest
+    from sd_commands import MESSAGE_LIMIT
+
+    items = [
+        SDRequest(
+            sys_id=f"{i:032x}",
+            number=f"REQ{i:04d}",
+            short_description=f"SUTSPROD-{1000 + i}",
+            assigned_user="Иванов И.И.",
+            sys_created_at="31.10.2026 14:00",
+            state="В работе",
+            multicard_comment_ing="",
+        ).with_base_url("https://sd.example.ru")
+        for i in range(1, 61)
+    ]
+    watcher = FakeWatcher()
+    watcher.client = FakeClient(items=items, total=60)
+    handlers = handlers_map(make_cfg(), watcher)
+    message = FakeMessage(user_id=1001)
+
+    await handlers["cmd_sd_dump"](message)
+
+    parts = message.answers[1:]  # первый ответ — «Загружаю...»
+    assert parts, "ничего не отправлено"
+    assert len(parts) > 1, f"длинный список не разрезан: {len(parts)} сообщений"
+    assert all(len(part) <= 4096 for part in parts), "есть сообщение длиннее лимита Telegram"
+    assert all(len(part) <= MESSAGE_LIMIT for part in parts[:-1]), "куски больше заявленного лимита"
+
+    joined = "\n".join(parts)
+    assert "SUTSPROD-1001" in joined, "первая заявка потерялась"
+    assert "SUTSPROD-1060" in joined, "последняя заявка потерялась"
+    assert joined.count("SUTSPROD-") == 60, f"заявок в списке: {joined.count('SUTSPROD-')}"
+    assert "record/itsm_request/" in joined, "в списке нет ссылок на заявки"
+    print(f"  OK: {len(items)} заявок пришли в {len(parts)} сообщениях, все со ссылками")
+
+
+async def scenario_dump_empty_and_permissions() -> None:
+    """/sd_dump: пустой фильтр и посторонний пользователь."""
+    watcher = FakeWatcher()
+    watcher.client = FakeClient(items=[], total=0)
+    handlers = handlers_map(make_cfg(), watcher)
+
+    message = FakeMessage(user_id=1001)
+    await handlers["cmd_sd_dump"](message)
+    assert "нет заявок" in message.last.lower(), f"пустой фильтр: {message.last}"
+    print("  OK: пустой фильтр обрабатывается")
+
+    stranger = FakeMessage(user_id=555)
+    await handlers["cmd_sd_dump"](stranger)
+    assert "Нет прав" in stranger.last, f"посторонний не должен получать список: {stranger.last}"
+    print("  OK: посторонний не может запросить все заявки")
+
+
+async def scenario_split_message() -> None:
+    """Разрезание длинного текста: ничего не теряется и лимит соблюдается."""
+    from sd_commands import split_message
+
+    line = "x" * 100
+    text = "\n".join(line for _ in range(100))  # 10 100 символов
+    parts = split_message(text, limit=1000)
+    assert len(parts) > 1, "текст не разрезан"
+    assert all(len(part) <= 1000 for part in parts), "лимит нарушен"
+    assert sum(part.count("x") for part in parts) == text.count("x"), "часть текста потерялась"
+    assert split_message("короткий текст", limit=1000) == ["короткий текст"]
+    print("  OK: длинный текст режется без потерь")
+
+
 async def main() -> None:
     print("Проверка команд /sd_*")
     for title, scenario in (
@@ -246,6 +317,9 @@ async def main() -> None:
         ("[/sd_test]", scenario_test_command),
         ("[спецсимволы в статусе]", scenario_status_escaping),
         ("[/sd_count без лишнего логина]", scenario_count_reuses_session),
+        ("[/sd_dump: все заявки]", scenario_dump_sends_all),
+        ("[/sd_dump: пусто и права]", scenario_dump_empty_and_permissions),
+        ("[разрезание сообщений]", scenario_split_message),
     ):
         print(f"\n{title}")
         await scenario()
