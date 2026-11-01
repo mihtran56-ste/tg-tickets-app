@@ -116,7 +116,15 @@ async def scenario_host_details() -> None:
         assert payload["host"]["telegram"] == "@ServMS_bot", f"нет данных Telegram: {payload}"
         assert payload["host"]["monitoring"] == "включён"
         assert payload["sd"]["seen_count"] == 25, "статус SD должен остаться"
-        print("  OK: с токеном видны Telegram и режим работы сервера")
+        # Счётчик запросов: по нему видно, что сервис действительно будят
+        assert payload["host"]["pings"] >= 1, f"счётчик пингов не работает: {payload}"
+        assert payload["host"]["last_ping"], "нет времени последнего пинга"
+        print("  OK: с токеном видны Telegram, режим работы и счётчик пингов")
+
+        # Второй запрос должен увеличить счётчик
+        status, payload2 = await get(port, f"/health?token={TOKEN}")
+        assert payload2["host"]["pings"] > payload["host"]["pings"], "счётчик не растёт"
+        print("  OK: счётчик пингов увеличивается")
     finally:
         await runner.cleanup()
 
