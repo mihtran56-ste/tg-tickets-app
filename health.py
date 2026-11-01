@@ -28,6 +28,7 @@ def _build_app(
     started_at: float,
     status_provider: StatusProvider | None,
     token: str,
+    extra_provider: StatusProvider | None = None,
 ) -> web.Application:
     app = web.Application()
 
@@ -40,12 +41,19 @@ def _build_app(
         # Подробности — только по токену, иначе публичный адрес раскрывает
         # внутреннее состояние мониторинга.
         details_allowed = bool(token) and request.query.get("token") == token
-        if status_provider is not None and details_allowed:
-            try:
-                payload["sd"] = status_provider()
-            except Exception:  # noqa: BLE001 — статус не должен ронять сервер
-                log.exception("Не удалось получить статус SD")
-                payload["sd_error"] = True
+        if details_allowed:
+            if status_provider is not None:
+                try:
+                    payload["sd"] = status_provider()
+                except Exception:  # noqa: BLE001 — статус не должен ронять сервер
+                    log.exception("Не удалось получить статус SD")
+                    payload["sd_error"] = True
+            if extra_provider is not None:
+                try:
+                    payload["host"] = extra_provider()
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось получить данные о хосте")
+                    payload["host_error"] = True
 
         return web.json_response(payload)
 
@@ -58,9 +66,10 @@ async def start_health_server(
     port: int,
     status_provider: StatusProvider | None = None,
     token: str = "",
+    extra_provider: StatusProvider | None = None,
 ) -> web.AppRunner:
     """Запускает HTTP-сервер и возвращает runner — его нужно закрыть в finally."""
-    app = _build_app(time.time(), status_provider, token)
+    app = _build_app(time.time(), status_provider, token, extra_provider)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
