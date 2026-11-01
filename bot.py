@@ -301,12 +301,26 @@ async def run(cfg: Config) -> None:
         await sd_watcher.start()
 
     # Мини-HTTP сервер для площадок, которым нужен «живой» порт (PORT=0 — выкл.)
+    # В подробном статусе видно, видит ли сервер Telegram и в каком режиме работает —
+    # это единственный способ проверить связь с ботом со стороны хостинга.
+    host_info: dict[str, object] = {
+        "started_at": time.strftime("%d.%m.%Y %H:%M:%S", time.localtime()),
+        "monitoring": monitoring_state,
+        "llm": "вкл" if llm_client else "выкл",
+    }
+    try:
+        me = await bot.get_me()
+        host_info["telegram"] = f"@{me.username}" if me.username else str(me.id)
+    except Exception as exc:  # noqa: BLE001 — диагностика не должна мешать запуску
+        host_info["telegram_error"] = f"{type(exc).__name__}: {exc}"
+
     health_runner = None
     if cfg.health_port:
         health_runner = await start_health_server(
             cfg.health_port,
             status_provider=(lambda: sd_watcher.get_status()) if sd_watcher else None,
             token=cfg.health_token,
+            extra_provider=lambda: host_info,
         )
 
     runtime_task: asyncio.Task | None = None
