@@ -159,12 +159,18 @@ class SDRequest:
     planning_state: str | None = None
     ab_spot_address: str | None = None
     hold_code: str | None = None
+    table: str = "itsm_request"
 
     @property
     def url(self) -> str:
-        """Прямая ссылка на заявку в SD."""
-        # Стандартный ServiceNow URL для открытия записи
-        return f"{self._base_url}/nav_to.do?uri=itsm_request.do?sys_id={self.sys_id}"
+        """Ссылка на заявку в SD.
+
+        SimpleOne открывает записи маршрутом SPA `/record/{таблица}/{sys_id}` —
+        это видно в коде самого приложения: openRecord(essence, id) собирает
+        «/record/» + essence + «/» + id. Прежний ServiceNow-формат
+        `/nav_to.do?uri=itsm_request.do?sys_id=…` в SimpleOne даёт 404.
+        """
+        return f"{self._base_url}/record/{self.table}/{self.sys_id}"
 
     @property
     def code(self) -> str:
@@ -202,6 +208,7 @@ class SDRequest:
             planning_state=self.planning_state,
             ab_spot_address=self.ab_spot_address,
             hold_code=self.hold_code,
+            table=self.table,
         )
         object.__setattr__(obj, "_base_url", base_url.rstrip("/"))
         return obj
@@ -734,6 +741,7 @@ class SDClient:
             planning_state=get_val("planning_state") or None,
             ab_spot_address=get_val("ab_spot_address") or None,
             hold_code=get_val("hold_code") or None,
+            table=get_val("__table_name") or "itsm_request",
         )
 
 
