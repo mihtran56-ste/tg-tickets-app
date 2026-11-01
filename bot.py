@@ -91,6 +91,7 @@ def build_help_text(llm_enabled: bool) -> str:
         "/sd_test — проверить SD прямо сейчас\n"
         "/sd_last N — последние N уведомлений из SD\n"
         "/sd_count — текущее количество заявок по фильтру\n"
+        "/sd_dump — все заявки по фильтру одним списком (админы)\n"
         "/sd_pause / /sd_resume — пауза/возобновление SD"
     )
 
