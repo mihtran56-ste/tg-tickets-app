@@ -21,6 +21,32 @@ def _esc(value: object) -> str:
     return html.escape(str(value)) if value is not None else ""
 
 
+# Telegram: предел одного сообщения — 4096 символов. Берём с запасом,
+# чтобы не ловить отказ на длинных списках заявок.
+MESSAGE_LIMIT = 3500
+MAX_DUMP = 200
+
+
+def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Режет длинный текст на части по строкам (HTML-теги внутри строк целы)."""
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    for line in text.split("\n"):
+        addition = len(line) + 1
+        if current and size + addition > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += addition
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def register_sd_commands(
     dp: Dispatcher,
     cfg: Config,
@@ -192,3 +218,49 @@ def register_sd_commands(
             )
         except Exception as e:
             await message.answer(f"❌ Ошибка: {type(e).__name__}: {e}")
+
+    @dp.message(Command("sd_dump"))
+    async def cmd_sd_dump(message: Message) -> None:
+        """Присылает в чат ВСЕ заявки по фильтру одним списком (админы)."""
+        if not cfg.sd_enabled:
+            await message.answer("⚠️ SD-мониторинг отключен")
+            return
+
+        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
+            await message.answer("⛔ Нет прав для этой команды")
+            return
+
+        await message.answer("🔄 Загружаю все заявки по фильтру...")
+
+        client = getattr(watcher, "client", None)
+        own_client = client is None
+        try:
+            if own_client:
+                from sd_client import SDClient
+
+                client = SDClient(cfg)
+            items, total = await client.fetch_requests(
+                view=cfg.sd_view,
+                condition=cfg.sd_condition,
+                limit=MAX_DUMP,
+            )
+        except Exception as e:
+            await message.answer(f"❌ Не удалось получить заявки: {type(e).__name__}: {e}")
+            return
+        finally:
+            if own_client and client is not None:
+                await client.close()
+
+        if not items:
+            await message.answer("📭 По фильтру сейчас нет заявок.")
+            return
+
+        header = f"📋 <b>Все заявки по фильтру: {len(items)}</b>"
+        if total and total > len(items):
+            header += f" (всего по фильтру {total}, показаны первые {len(items)})"
+
+        lines = [header, ""]
+        lines.extend(item.format_short(index) for index, item in enumerate(items, 1))
+
+        for chunk in split_message("\n".join(lines)):
+            await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
