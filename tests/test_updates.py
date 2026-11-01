@@ -116,7 +116,7 @@ async def scenario_allowed_user(data_dir: Path) -> None:
         assert "Иван" in bot.last_text(), f"нет имени: {bot.last_text()}"
 
         await feed(dp, bot, make_update("/help", message_id=2))
-        assert "Бот заявок" in bot.last_text(), f"нет справки: {bot.last_text()}"
+        assert "Что умею" in bot.last_text(), f"нет справки: {bot.last_text()}"
         print("  OK: /start и /help отвечают разрешённому пользователю")
 
         bot.reset()
@@ -157,7 +157,7 @@ async def scenario_open_bot(data_dir: Path) -> None:
     bot = RecordingBot()
     try:
         await feed(dp, bot, make_update("/help", user_id=STRANGER, chat_id=STRANGER))
-        assert "Бот заявок" in bot.last_text(), f"открытый бот не ответил: {bot.last_text()}"
+        assert "Что умею" in bot.last_text(), f"открытый бот не ответил: {bot.last_text()}"
         print("  OK: при пустом ALLOWED_USER_IDS бот отвечает всем")
     finally:
         await bot.session.close()
@@ -234,17 +234,27 @@ async def scenario_stranger_can_get_id(data_dir: Path) -> None:
 
 
 async def scenario_help_matches_capabilities(data_dir: Path) -> None:
-    """Справка не обещает диалог с ИИ, если он не подключён."""
+    """Справка: начинается с умений, содержит все команды, честна про ИИ."""
     store = TicketStore(data_dir / "tickets.json")
+
+    ALL_COMMANDS = [
+        "/start", "/help", "/id", "/my", "/all",
+        "/sd_status", "/sd_test", "/sd_count", "/sd_dump", "/sd_last",
+        "/sd_pause", "/sd_resume",
+    ]
 
     off = build_dispatcher(make_cfg(data_dir), store, llm_client=None)
     bot = RecordingBot()
     try:
         await feed(off, bot, make_update("/help"))
         text = bot.last_text()
-        assert "не подключён" in text, f"без LLM справка должна это говорить: {text}"
-        assert "создам заявку" not in text, f"без LLM нельзя обещать создание заявки: {text}"
-        print("  OK: без LLM справка честно говорит об отключённом диалоге")
+
+        # Вступления перед «Что умею» больше нет
+        assert text.lstrip().startswith("🛠"), f"справка должна начинаться с «Что умею»: {text[:60]!r}"
+        for command in ALL_COMMANDS:
+            assert command in text, f"в справке нет команды {command}:\n{text}"
+        assert "выключен" in text.lower(), f"без LLM должно быть сказано, что диалог выключен: {text}"
+        print(f"  OK: справка без вступления, все {len(ALL_COMMANDS)} команд на месте")
     finally:
         await bot.session.close()
 
@@ -253,9 +263,9 @@ async def scenario_help_matches_capabilities(data_dir: Path) -> None:
     try:
         await feed(on, bot, make_update("/help"))
         text = bot.last_text()
-        assert "напиши, в чём проблема" in text.lower(), f"с LLM справка должна приглашать к диалогу: {text}"
-        assert "не подключён" not in text, f"с LLM не должно быть отказа: {text}"
-        print("  OK: с LLM справка приглашает описать проблему")
+        assert "создавать заявки из твоего описания" in text.lower(), f"с LLM нет строки про создание заявок: {text}"
+        assert "выключен" not in text.lower(), f"с LLM не должно быть отказа: {text}"
+        print("  OK: с LLM справка обещает диалог и создание заявок")
     finally:
         await bot.session.close()
 
