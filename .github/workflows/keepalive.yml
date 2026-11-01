@@ -1,0 +1,22 @@
+name: keepalive
+
+# Free-сервис Render засыпает через ~15 минут без HTTP-трафика.
+# Этот пинг раз в 10 минут держит его живым. Для публичных репозиториев
+# минуты Actions бесплатны и не расходуют лимит.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Пинг /health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Разбудить сервис
+        run: |
+          curl -fsS --max-time 30 https://tg-tickets.onrender.com/health
+          echo
+          echo "сервис отвечает"
