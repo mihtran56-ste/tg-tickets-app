@@ -173,7 +173,7 @@ async def scenario_html_in_data(data_dir: Path) -> None:
     assert "&lt;script&gt;" in text, f"скрипт из данных не экранирован: {text}"
     # Собственная разметка бота должна остаться рабочей
     assert "<b>Тема:</b>" in text, f"пропала своя разметка: {text}"
-    assert '<a href="https://sd.example.ru/nav_to.do' in text, "пропала ссылка на заявку"
+    assert '<a href="https://sd.example.ru/record/itsm_request/' in text, "пропала ссылка на заявку"
     print("  OK: данные из SD экранируются, своя разметка сохраняется")
 
 
