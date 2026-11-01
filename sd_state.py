@@ -18,6 +18,16 @@ log = logging.getLogger("sd_state")
 
 STATE_FILE = "sd_state.json"
 MAX_SEEN = 2000  # максимум запомненных номеров заявок
+MAX_SLA_EVENTS = 2000  # максимум заявок под SLA-наблюдением
+SLA_MAX_AGE_SECONDS = 7 * 24 * 3600  # записи без обновлений старше недели не нужны
+
+
+def _sla_number(entry: dict[str, Any], key: str, sys_id: object) -> float:
+    """Число из записи SLA с понятной ошибкой вместо тихого ValueError."""
+    value = entry.get(key, 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"sla_events[{sys_id}][{key}] должно быть числом")
+    return float(value)
 
 
 @dataclass
@@ -32,6 +42,13 @@ class SDState:
     total_notifications_sent: int = 0
     last_error: str = ""
     last_error_time: float = 0.0
+    # SLA: инициализированы ли наблюдения (нужно, чтобы при первом включении
+    # не присылать пачку «сгоревших» заявок за всю историю).
+    sla_initialized: bool = False
+    # sys_id -> {"deadline": строка, "warn": ts, "expired": ts, "last_seen": ts}
+    sla_events: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sla_warn_sent: int = 0
+    sla_expired_sent: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +59,10 @@ class SDState:
             "total_notifications_sent": self.total_notifications_sent,
             "last_error": self.last_error,
             "last_error_time": self.last_error_time,
+            "sla_initialized": self.sla_initialized,
+            "sla_events": self.sla_events,
+            "sla_warn_sent": self.sla_warn_sent,
+            "sla_expired_sent": self.sla_expired_sent,
         }
 
     @classmethod
@@ -73,6 +94,30 @@ class SDState:
         if not isinstance(total_sent, int) or isinstance(total_sent, bool):
             raise TypeError("поле total_notifications_sent должно быть целым числом")
 
+        sla_initialized = data.get("sla_initialized", False)
+        if not isinstance(sla_initialized, bool):
+            raise TypeError("поле sla_initialized должно быть true или false")
+
+        raw_events = data.get("sla_events", {})
+        if not isinstance(raw_events, dict):
+            raise TypeError("поле sla_events должно быть объектом")
+
+        sla_events: dict[str, dict[str, Any]] = {}
+        for key, entry in raw_events.items():
+            if not isinstance(entry, dict):
+                raise TypeError(f"sla_events[{key}] должно быть объектом")
+            sla_events[str(key)] = {
+                "deadline": str(entry.get("deadline") or ""),
+                "warn": _sla_number(entry, "warn", key),
+                "expired": _sla_number(entry, "expired", key),
+                "last_seen": _sla_number(entry, "last_seen", key),
+            }
+
+        for name in ("sla_warn_sent", "sla_expired_sent"):
+            value = data.get(name, 0)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"поле {name} должно быть целым числом")
+
         return cls(
             last_check=float(data.get("last_check", 0.0)),
             seen_numbers=[str(item) for item in data.get("seen_numbers", [])],
@@ -81,6 +126,10 @@ class SDState:
             total_notifications_sent=int(total_sent),
             last_error=str(data.get("last_error") or ""),
             last_error_time=float(data.get("last_error_time", 0.0)),
+            sla_initialized=sla_initialized,
+            sla_events=sla_events,
+            sla_warn_sent=int(data.get("sla_warn_sent", 0)),
+            sla_expired_sent=int(data.get("sla_expired_sent", 0)),
         )
 
     def is_seen(self, number: str, sys_id: str) -> bool:
@@ -112,6 +161,62 @@ class SDState:
     def label_for(self, number: str) -> str:
         """Рабочий код заявки (SUTSPROD-…), если он известен."""
         return self.seen_labels.get(number, "")
+
+    # --- SLA -----------------------------------------------------------------
+
+    def sync_sla(self, sys_id: str, deadline: str, now_ts: float) -> dict[str, Any]:
+        """Обновляет запись SLA и сбрасывает флаги, если дедлайн перенесли."""
+        entry = self.sla_events.get(sys_id)
+        if entry is None:
+            entry = {"deadline": deadline, "warn": 0.0, "expired": 0.0, "last_seen": 0.0}
+            self.sla_events[sys_id] = entry
+        elif entry.get("deadline") != deadline:
+            entry["deadline"] = deadline
+            entry["warn"] = 0.0
+            entry["expired"] = 0.0
+        entry["last_seen"] = now_ts
+        return entry
+
+    def mark_sla(self, sys_id: str, kind: str, deadline: str, ts: float) -> None:
+        """Отмечает, что сообщение SLA по заявке уже отправлено."""
+        entry = self.sla_events.get(sys_id)
+        if entry is None:
+            entry = {"deadline": deadline, "warn": 0.0, "expired": 0.0, "last_seen": ts}
+            self.sla_events[sys_id] = entry
+        if entry.get("deadline") != deadline:
+            entry["deadline"] = deadline
+        if kind == "warn":
+            entry["warn"] = entry.get("warn") or ts
+        else:
+            entry["expired"] = entry.get("expired") or ts
+            # Просрочка отменяет предупреждение: «осталось 2 ч» уже неактуально.
+            entry["warn"] = entry.get("warn") or ts
+
+    def record_sla_sent(self, kind: str) -> None:
+        if kind == "warn":
+            self.sla_warn_sent += 1
+        else:
+            self.sla_expired_sent += 1
+
+    def prune_sla(
+        self,
+        now_ts: float,
+        max_age: float = SLA_MAX_AGE_SECONDS,
+        limit: int = MAX_SLA_EVENTS,
+    ) -> None:
+        """Убирает записи по заявкам, которых давно нет в фильтре."""
+        self.sla_events = {
+            sys_id: entry
+            for sys_id, entry in self.sla_events.items()
+            if now_ts - float(entry.get("last_seen") or 0.0) <= max_age
+        }
+        if len(self.sla_events) > limit:
+            freshest = sorted(
+                self.sla_events.items(),
+                key=lambda item: float(item[1].get("last_seen") or 0.0),
+                reverse=True,
+            )[:limit]
+            self.sla_events = dict(freshest)
 
     def record_notification_sent(self) -> None:
         self.total_notifications_sent += 1
@@ -228,4 +333,8 @@ class SDStateStore:
             "total_sent": s.total_notifications_sent,
             "last_error": s.last_error,
             "last_error_time": s.last_error_time,
+            "sla_initialized": s.sla_initialized,
+            "sla_tracked": len(s.sla_events),
+            "sla_warn_sent": s.sla_warn_sent,
+            "sla_expired_sent": s.sla_expired_sent,
         }

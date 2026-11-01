@@ -1,6 +1,6 @@
 """ServiceDesk клиент для получения заявок.
 
-Работает с ITSM на базе ServiceNow (sd.example.ru).
+Работает с ITSM на базе ServiceNow (sd.servionica.ru).
 Авторизация через форму логина (session + cookies).
 """
 
@@ -124,6 +124,32 @@ def format_sd_datetime(value: str, default: str = "") -> str:
     return text
 
 
+def parse_sd_datetime(value: str) -> datetime | None:
+    """Разбирает время из SD в datetime (без часового пояса).
+
+    Нужен для SLA: в отличие от format_sd_datetime сохраняет секунды и не
+    превращает неизвестный формат в строку — такое время просто не считается
+    дедлайном, чтобы не присылать ложные алерты.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def redact_secrets(text: str) -> str:
     """Прячет токены и пароли перед записью в лог.
 
@@ -160,6 +186,8 @@ class SDRequest:
     ab_spot_address: str | None = None
     hold_code: str | None = None
     table: str = "itsm_request"
+    # Дедлайн СУТС для расчёта SLA: сырое время без потери секунд.
+    deadline_at: datetime | None = None
 
     @property
     def url(self) -> str:
@@ -223,6 +251,7 @@ class SDRequest:
             ab_spot_address=self.ab_spot_address,
             hold_code=self.hold_code,
             table=self.table,
+            deadline_at=self.deadline_at,
         )
         object.__setattr__(obj, "_base_url", base_url.rstrip("/"))
         return obj
@@ -756,6 +785,7 @@ class SDClient:
             ab_spot_address=get_val("ab_spot_address") or None,
             hold_code=get_val("hold_code") or None,
             table=get_val("__table_name") or "itsm_request",
+            deadline_at=parse_sd_datetime(unwrap_value(item.get("multicard_deadline"))),
         )
 
 

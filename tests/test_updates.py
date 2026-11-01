@@ -239,7 +239,7 @@ async def scenario_help_matches_capabilities(data_dir: Path) -> None:
 
     ALL_COMMANDS = [
         "/start", "/help", "/id", "/my", "/all",
-        "/sd_status", "/sd_test", "/sd_count", "/sd_dump", "/sd_last",
+        "/sd_status", "/sd_test", "/sd_count", "/sd_dump", "/sd_today", "/sd_last",
         "/sd_pause", "/sd_resume",
     ]
 
@@ -254,6 +254,7 @@ async def scenario_help_matches_capabilities(data_dir: Path) -> None:
         for command in ALL_COMMANDS:
             assert command in text, f"в справке нет команды {command}:\n{text}"
         assert "выключен" in text.lower(), f"без LLM должно быть сказано, что диалог выключен: {text}"
+        assert "SLA" in text, f"в справке нет SLA-возможностей: {text}"
         print(f"  OK: справка без вступления, все {len(ALL_COMMANDS)} команд на месте")
     finally:
         await bot.session.close()

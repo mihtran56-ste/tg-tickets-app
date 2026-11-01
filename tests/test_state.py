@@ -137,6 +137,74 @@ def scenario_labels(tmp: Path) -> None:
     print("  OK: неверный тип seen_labels не роняет запуск")
 
 
+def scenario_sla_state(tmp: Path) -> None:
+    """Флаги SLA переживают перезапуск, а перенос дедлайна их сбрасывает."""
+    store = SDStateStore(fresh(tmp / "sla"))
+    state = store.load()
+    state.sla_initialized = True
+    state.sync_sla("a1", "2026-11-01 18:00:00", 1000.0)
+    state.mark_sla("a1", "warn", "2026-11-01 18:00:00", 1000.0)
+    state.record_sla_sent("warn")
+    store.save()
+
+    reloaded = SDStateStore(store.path.parent).load()
+    assert reloaded.sla_initialized is True
+    assert reloaded.sla_events["a1"]["warn"] == 1000.0, "флаг предупреждения не сохранился"
+    assert reloaded.sla_warn_sent == 1, "счётчик предупреждений не сохранился"
+    print("  OK: состояние SLA и счётчики переживают перезапуск")
+
+    entry = reloaded.sync_sla("a1", "2026-11-01 20:00:00", 2000.0)
+    assert entry["warn"] == 0.0 and entry["expired"] == 0.0, (
+        "перенос дедлайна не сбросил флаги — алерты по новому сроку не придут"
+    )
+    reloaded.mark_sla("a1", "expired", "2026-11-01 20:00:00", 3000.0)
+    assert reloaded.sla_events["a1"]["expired"] == 3000.0
+    assert reloaded.sla_events["a1"]["warn"] == 3000.0, "просрочка должна закрывать предупреждение"
+    print("  OK: перенос дедлайна сбрасывает флаги, просрочка закрывает предупреждение")
+
+
+def scenario_sla_prune() -> None:
+    """Старые записи SLA убираются, свежие остаются."""
+    state = SDState()
+    state.sync_sla("old", "d", 0.0)
+    state.sync_sla("fresh", "d", 863000.0)
+    state.prune_sla(now_ts=864000.0)
+
+    assert "old" not in state.sla_events, "запись без обновлений больше недели не удалена"
+    assert "fresh" in state.sla_events, "свежая запись удалена"
+
+    state = SDState()
+    for index in range(3):
+        state.sync_sla(f"id{index}", "d", 1000.0 + index)
+    state.prune_sla(now_ts=1000.0, limit=2)
+    assert set(state.sla_events) == {"id1", "id2"}, f"лимит не применён: {list(state.sla_events)}"
+    print("  OK: записи SLA чистятся по возрасту и ограничиваются по количеству")
+
+
+def scenario_old_state_without_sla(tmp: Path) -> None:
+    """Старый sd_state.json без полей SLA читается без потери истории."""
+    data_dir = fresh(tmp / "old_sla")
+    (data_dir / "sd_state.json").write_text(
+        json.dumps(
+            {
+                "last_check": 1.0,
+                "seen_numbers": ["REQ1"],
+                "seen_sys_ids": ["a1"],
+                "total_notifications_sent": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = SDStateStore(data_dir).load()
+
+    assert state.seen_numbers == ["REQ1"], "история увиденных заявок потерялась"
+    assert state.sla_initialized is False, "SLA должен инициализироваться тихо при обновлении"
+    assert state.sla_events == {}
+    assert not list(data_dir.glob("sd_state.json.corrupt-*")), "старый файл не должен считаться битым"
+    print("  OK: старый файл состояния без SLA читается как есть")
+
+
 def scenario_atomic_save(tmp: Path) -> None:
     data_dir = fresh(tmp / "atomic")
     store = SDStateStore(data_dir)
@@ -156,6 +224,9 @@ def main() -> None:
         ("[повреждённый файл]", lambda: scenario_corrupt_file(base)),
         ("[неверная структура]", lambda: scenario_wrong_structure(base)),
         ("[код заявки]", lambda: scenario_labels(base)),
+        ("[состояние SLA]", lambda: scenario_sla_state(base)),
+        ("[чистка SLA]", lambda: scenario_sla_prune()),
+        ("[старый файл без SLA]", lambda: scenario_old_state_without_sla(base)),
         ("[атомарность]", lambda: scenario_atomic_save(base)),
     ):
         print(f"\n{title}")

@@ -9,13 +9,20 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
-from sd_client import SDClient, extract_subject_code, format_sd_datetime, unwrap_value  # noqa: E402
+from sd_client import (  # noqa: E402
+    SDClient,
+    extract_subject_code,
+    format_sd_datetime,
+    parse_sd_datetime,
+    unwrap_value,
+)
 
 # Так реально выглядит запись из /v1/list/itsm_request
 RAW_ITEM = {
@@ -78,6 +85,20 @@ def scenario_datetime() -> None:
     print("  OK: даты приводятся к «31.10.2026 14:29», неизвестные не теряются")
 
 
+def scenario_deadline_parse() -> None:
+    """Для SLA нужен datetime с секундами, а не строка для показа."""
+    from datetime import datetime
+
+    expected = datetime(2026, 11, 1, 10, 40, 53)
+    assert parse_sd_datetime("2026-11-01 10:40:53") == expected
+    assert parse_sd_datetime("2026-11-01 10:40") == datetime(2026, 11, 1, 10, 40)
+    assert parse_sd_datetime("2026-11-01") == datetime(2026, 11, 1)
+    assert parse_sd_datetime("01.11.2026 10:40") == datetime(2026, 11, 1, 10, 40)
+    assert parse_sd_datetime("ерунда") is None, "неизвестный формат — не дедлайн"
+    assert parse_sd_datetime("") is None
+    print("  OK: дедлайн разбирается в datetime с секундами, мусор — None")
+
+
 def scenario_parse_item() -> None:
     client = make_client()
     request = client._parse_item(RAW_ITEM)
@@ -90,13 +111,19 @@ def scenario_parse_item() -> None:
     assert request.planning_state == "Запланирована", f"планирование: {request.planning_state!r}"
     assert request.sys_created_at == "31.10.2026 14:29", f"дата создания: {request.sys_created_at!r}"
     assert request.multicard_deadline == "01.11.2026 10:40", f"дедлайн: {request.multicard_deadline!r}"
+    assert request.deadline_at == datetime(2026, 11, 1, 10, 40, 53), (
+        f"дедлайн для SLA: {request.deadline_at!r}"
+    )
+    assert request.with_base_url("https://sd.example.ru").deadline_at == request.deadline_at, (
+        "deadline_at потерялся при подстановке base_url"
+    )
     assert request.multicard_pos == "82251125906536"
     print("  OK: запись разбирается в человеческие значения")
 
 
 def scenario_notification() -> None:
     client = make_client()
-    request = client._parse_item(RAW_ITEM).with_base_url("https://sd.example.ru")
+    request = client._parse_item(RAW_ITEM).with_base_url("https://sd.servionica.ru")
     text = request.format_notification(23)
 
     assert "database_value" not in text, f"в уведомлении остался дамп словаря:\n{text}"
@@ -107,7 +134,7 @@ def scenario_notification() -> None:
     assert "<b>Статус:</b> В работе" in text, f"статус не человеческий:\n{text}"
     assert "<b>Планирование:</b> Запланирована" in text, f"планирование не человеческое:\n{text}"
     assert "31.10.2026 14:29" in text, f"дата не отформатирована:\n{text}"
-    assert 'href="https://sd.example.ru/record/itsm_request/' in text, "ссылка должна вести на /record/"
+    assert 'href="https://sd.servionica.ru/record/itsm_request/' in text, "ссылка должна вести на /record/"
     print("  OK: заголовок — только код SUTSPROD, без REQ")
 
 
@@ -124,7 +151,7 @@ def scenario_notification_without_code() -> None:
     plain = dict(RAW_ITEM)
     plain["short_description"] = {"value": "Не работает принтер"}
     client = make_client()
-    request = client._parse_item(plain).with_base_url("https://sd.example.ru")
+    request = client._parse_item(plain).with_base_url("https://sd.servionica.ru")
     text = request.format_notification()
 
     assert "<b>Новая заявка: REQ4308671</b>" in text, f"без кода заголовок — REQ:\n{text}"
@@ -138,6 +165,7 @@ def main() -> None:
     for title, scenario in (
         ("[разворачивание обёрток]", scenario_unwrap),
         ("[формат дат]", scenario_datetime),
+        ("[дедлайн для SLA]", scenario_deadline_parse),
         ("[разбор записи]", scenario_parse_item),
         ("[текст уведомления]", scenario_notification),
         ("[код в теме]", scenario_code_detection),

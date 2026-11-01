@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from config import Config
+from sd_sla import now_in, today_blocks
 from sd_watcher import SDWatcher
 
 
@@ -47,6 +48,27 @@ def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+def pack_blocks(blocks: list[str], limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Собирает блоки в сообщения, не разрывая блок (карточку заявки)."""
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    for block in blocks:
+        addition = len(block) + (2 if current else 0)  # разделитель "\n\n"
+        if current and size + addition > limit:
+            chunks.append("\n\n".join(current))
+            current = []
+            size = 0
+            addition = len(block)
+        current.append(block)
+        size += addition
+
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
 def register_sd_commands(
     dp: Dispatcher,
     cfg: Config,
@@ -79,6 +101,18 @@ def register_sd_commands(
             f"📨 Отправлено уведомлений: {_esc(status['total_sent'])}",
             f"⚠️ Последняя ошибка: {_esc(status['last_error'])} ({_esc(status['last_error_time'])})",
         ]
+
+        sla = status.get("sla") or {}
+        if sla:
+            warn_hours = f"{float(sla.get('warn_hours', 2)):g}".replace(".", ",")
+            lines.append(
+                f"⏰ SLA: {'✅ вкл' if sla.get('enabled') else '❌ выкл'}"
+                f", порог {_esc(warn_hours)} ч"
+            )
+            lines.append(
+                f"  Предупреждений: {_esc(sla.get('warn_sent', 0))}, "
+                f"сгорело: {_esc(sla.get('expired_sent', 0))}"
+            )
 
         if status["last_result"]:
             lr = status["last_result"]
@@ -124,6 +158,12 @@ def register_sd_commands(
                 ]
             if result.errors:
                 lines.append(f"⚠️ Ошибки: {'; '.join(result.errors)}")
+            sla_warned = getattr(result, "sla_warned", 0)
+            sla_expired = getattr(result, "sla_expired", 0)
+            if sla_warned or sla_expired:
+                lines.append(
+                    f"⏰ SLA: предупреждений {sla_warned}, сгорело {sla_expired}"
+                )
             await message.answer("\n".join(lines))
         except Exception as e:
             await message.answer(f"❌ Ошибка: {type(e).__name__}: {e}")
@@ -263,4 +303,39 @@ def register_sd_commands(
         lines.extend(item.format_short(index) for index, item in enumerate(items, 1))
 
         for chunk in split_message("\n".join(lines)):
+            await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+    @dp.message(Command("sd_today"))
+    async def cmd_sd_today(message: Message) -> None:
+        """Заявки, у которых дедлайн СУТС сегодня (в часовом поясе SD)."""
+        if not cfg.sd_enabled:
+            await message.answer("⚠️ SD-мониторинг отключен")
+            return
+
+        await message.answer("🔄 Смотрю дедлайны на сегодня...")
+
+        # Переиспользуем сессию монитора, как /sd_count и /sd_dump: иначе
+        # каждая команда делала бы лишний логин в ServiceDesk.
+        client = getattr(watcher, "client", None)
+        own_client = client is None
+        try:
+            if own_client:
+                from sd_client import SDClient
+
+                client = SDClient(cfg)
+            items, _total = await client.fetch_requests(
+                view=cfg.sd_view,
+                condition=cfg.sd_condition,
+                limit=MAX_DUMP,
+            )
+        except Exception as e:
+            await message.answer(f"❌ Не удалось получить заявки: {type(e).__name__}: {e}")
+            return
+        finally:
+            if own_client and client is not None:
+                await client.close()
+
+        moment = now_in(cfg.sd_timezone)
+        blocks = today_blocks(items, moment, cfg.sd_timezone)
+        for chunk in pack_blocks(blocks):
             await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)

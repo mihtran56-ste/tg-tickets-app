@@ -43,6 +43,10 @@ class Config:
     sd_condition: str = ""
     sd_seed_on_first_run: bool = True
     sd_verify_ssl: bool = True
+    # SLA: предупреждение за N часов до дедлайна СУТС и сообщение о просрочке
+    sd_sla_enabled: bool = True
+    sd_sla_warn_hours: float = 2.0
+    sd_timezone: str = "Europe/Moscow"
     # Хостинг
     health_port: int = 0
     health_token: str = ""
@@ -141,6 +145,19 @@ def load_config() -> Config:
     if problems:
         raise ValueError("\n".join(f"• {problem}" for problem in problems))
 
+    # Часовой пояс проверяем до создания папок: опечатка в SD_TIMEZONE иначе
+    # всплывёт только на первом тике мониторинга, когда посчитать SLA уже нельзя.
+    timezone_name = _env("SD_TIMEZONE", "Europe/Moscow") or "Europe/Moscow"
+    try:
+        from sd_sla import resolve_timezone
+
+        resolve_timezone(timezone_name)
+    except ValueError as exc:
+        problems.append(str(exc))
+
+    if problems:
+        raise ValueError("\n".join(f"• {problem}" for problem in problems))
+
     data_dir = _data_dir()
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -171,6 +188,9 @@ def load_config() -> Config:
         sd_condition=_env("SD_CONDITION"),
         sd_seed_on_first_run=_bool_env("SD_SEED_ON_FIRST_RUN", True),
         sd_verify_ssl=_bool_env("SD_VERIFY_SSL", True),
+        sd_sla_enabled=_bool_env("SD_SLA_ENABLED", True),
+        sd_sla_warn_hours=_float_env("SD_SLA_WARN_HOURS", 2.0, 0.0, 72.0),
+        sd_timezone=timezone_name,
         # Хостинг
         health_port=_int_env("PORT", 0, 0),
         health_token=_env("HEALTH_TOKEN"),

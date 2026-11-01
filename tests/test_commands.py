@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,8 +17,11 @@ sys.path.insert(0, str(ROOT))
 
 from aiogram import Dispatcher  # noqa: E402
 
+import sd_commands as sd_commands_module  # noqa: E402
 from config import Config  # noqa: E402
-from sd_commands import register_sd_commands  # noqa: E402
+from sd_client import SDRequest  # noqa: E402
+from sd_commands import pack_blocks, register_sd_commands  # noqa: E402
+from sd_sla import resolve_timezone  # noqa: E402
 
 
 class FakeUser:
@@ -307,6 +311,125 @@ async def scenario_split_message() -> None:
     print("  OK: длинный текст режется без потерь")
 
 
+def make_deadline_request(index: int, deadline: datetime | None) -> SDRequest:
+    return SDRequest(
+        sys_id=f"{index:032x}",
+        number=f"REQ{4300000 + index}",
+        short_description=f"SUTSPROD-{17350000 + index}",
+        assigned_user="Иванов И.И.",
+        sys_created_at="01.11.2026 09:00",
+        state="В работе",
+        multicard_comment_ing="",
+        multicard_request_type="Поддержка касс",
+        multicard_name_client="produkty",
+        multicard_terminal_address="Нижний Новгород, пер Камчатский, 7",
+        multicard_deadline=(
+            deadline.strftime("%d.%m.%Y %H:%M") if deadline is not None else None
+        ),
+        deadline_at=deadline,
+    ).with_base_url("https://sd.example.ru")
+
+
+async def scenario_sd_today() -> None:
+    """/sd_today: только сегодняшние дедлайны, по порядку, со ссылками."""
+    tz = resolve_timezone("Europe/Moscow")
+    fixed = datetime(2026, 11, 1, 12, 0, tzinfo=tz)
+    original = sd_commands_module.now_in
+    sd_commands_module.now_in = lambda _tz: fixed
+
+    try:
+        items = [
+            make_deadline_request(1, datetime(2026, 11, 1, 18, 0)),
+            make_deadline_request(2, datetime(2026, 11, 1, 10, 0)),
+            make_deadline_request(3, datetime(2026, 11, 2, 9, 0)),
+        ]
+        watcher = FakeWatcher()
+        watcher.client = FakeClient(items=items, total=3)
+        handlers = handlers_map(make_cfg(), watcher)
+
+        message = FakeMessage(user_id=1001)
+        await handlers["cmd_sd_today"](message)
+
+        assert any("Смотрю дедлайны" in answer for answer in message.answers), (
+            f"нет промежуточного сообщения: {message.answers}"
+        )
+        text = "\n\n".join(message.answers[1:])
+        assert "Сгорят сегодня, 01.11.2026 — 2" in text, f"заголовок:\n{text}"
+        assert "уже сгорели: 1" in text, f"нет пометки о сгоревших:\n{text}"
+        assert "Дедлайн СУТС: 01.11.2026 18:00" in text
+        assert "Дедлайн СУТС: 01.11.2026 10:00" in text
+        assert "REQ4300003" not in text, "завтрашняя заявка попала в отчёт"
+        assert text.index("10:00") < text.index("18:00"), "сортировка по времени сломана"
+        assert "Тип:" not in text and "Поддержка касс" in text, "тип заявки не показан"
+        assert "produkty" in text and "пер Камчатский" in text
+        assert "record/itsm_request/" in text, "нет ссылок на заявки"
+        print("  OK: /sd_today показывает только сегодняшние сроки по порядку")
+    finally:
+        sd_commands_module.now_in = original
+
+    empty = FakeWatcher()
+    empty.client = FakeClient(items=[], total=0)
+    handlers = handlers_map(make_cfg(), empty)
+    message = FakeMessage(user_id=1001)
+    await handlers["cmd_sd_today"](message)
+    text = "\n\n".join(message.answers[1:])
+    assert "— 0" in text and "ничего не сгорает" in text, f"пустой отчёт:\n{text}"
+    print("  OK: пустой /sd_today отвечает понятно")
+
+    disabled = handlers_map(make_cfg(enabled=False), FakeWatcher())
+    message = FakeMessage(user_id=1001)
+    await disabled["cmd_sd_today"](message)
+    assert "отключен" in message.last.lower(), f"выключенный SD: {message.last}"
+    print("  OK: при выключенном SD /sd_today сообщает об отключении")
+
+
+async def scenario_pack_blocks() -> None:
+    """Карточки не разрываются при нарезке на сообщения."""
+    blocks = ["x" * 100, "y" * 100, "z" * 100]
+    parts = pack_blocks(blocks, limit=250)
+
+    assert len(parts) == 2, f"ожидали 2 сообщения, получили {len(parts)}"
+    assert all(len(part) <= 250 for part in parts), "лимит нарушен"
+    assert parts[0] == "x" * 100 + "\n\n" + "y" * 100, "карточки склеены неверно"
+    assert parts[1] == "z" * 100, "блок разорван"
+    assert pack_blocks(["короткий"], limit=250) == ["короткий"]
+    print("  OK: pack_blocks режет по границам карточек")
+
+
+async def scenario_status_sla() -> None:
+    """В /sd_status видно состояние SLA-контроля."""
+    status = {
+        "running": True,
+        "paused": False,
+        "interval_sec": 60,
+        "last_check": "01.11.2026 12:00:00",
+        "seen_count": 25,
+        "total_sent": 25,
+        "last_error": "нет",
+        "last_error_time": "—",
+        "last_result": None,
+        "sla": {
+            "enabled": True,
+            "warn_hours": 2.0,
+            "initialized": True,
+            "tracked": 7,
+            "warn_sent": 3,
+            "expired_sent": 2,
+        },
+    }
+    watcher = FakeWatcher(status=status)
+    handlers = handlers_map(make_cfg(), watcher)
+    message = FakeMessage(user_id=1001)
+
+    await handlers["cmd_sd_status"](message)
+    text = message.last
+
+    assert "SLA: ✅ вкл" in text, f"нет статуса SLA:\n{text}"
+    assert "порог 2 ч" in text
+    assert "Предупреждений: 3" in text and "сгорело: 2" in text
+    print("  OK: /sd_status показывает порог и счётчики SLA")
+
+
 async def main() -> None:
     print("Проверка команд /sd_*")
     for title, scenario in (
@@ -320,6 +443,9 @@ async def main() -> None:
         ("[/sd_dump: все заявки]", scenario_dump_sends_all),
         ("[/sd_dump: пусто и права]", scenario_dump_empty_and_permissions),
         ("[разрезание сообщений]", scenario_split_message),
+        ("[/sd_today]", scenario_sd_today),
+        ("[нарезка карточек]", scenario_pack_blocks),
+        ("[SLA в /sd_status]", scenario_status_sla),
     ):
         print(f"\n{title}")
         await scenario()

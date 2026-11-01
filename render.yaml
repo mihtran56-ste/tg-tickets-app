@@ -18,13 +18,19 @@ services:
       - key: SD_ENABLED
         value: "true"
       - key: SD_BASE_URL
-        sync: false
+        value: https://sd.servionica.ru
       - key: SD_VIEW
         value: Default
       - key: SD_CHECK_INTERVAL
         value: "60"
       - key: SD_SEED_ON_FIRST_RUN
         value: "true"
+      - key: SD_SLA_ENABLED
+        value: "true"
+      - key: SD_SLA_WARN_HOURS
+        value: "2"
+      - key: SD_TIMEZONE
+        value: Europe/Moscow
       - key: NOTIFY_ON_START
         value: "false"
       - key: NOTIFY_ON_STOP

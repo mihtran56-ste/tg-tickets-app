@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import shutil
 import sys
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,8 +18,16 @@ sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
 from sd_client import SDRequest  # noqa: E402
+from sd_sla import resolve_timezone  # noqa: E402
 from sd_state import SDStateStore  # noqa: E402
 from sd_watcher import SDWatcher  # noqa: E402
+
+TZ = resolve_timezone("Europe/Moscow")
+
+
+def at(hour: int = 12, minute: int = 0, day: int = 1) -> datetime:
+    """Время в поясе SD (Москва) для сценариев SLA."""
+    return datetime(2026, 11, day, hour, minute, tzinfo=TZ)
 
 
 class FakeBot:
@@ -25,9 +35,11 @@ class FakeBot:
 
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.kwargs: list[dict] = []
 
-    async def send_message(self, chat_id: int, text: str, **_kwargs: object) -> None:
+    async def send_message(self, chat_id: int, text: str, **kwargs: object) -> None:
         self.sent.append((chat_id, text))
+        self.kwargs.append(kwargs)
 
 
 class FakeClient:
@@ -65,6 +77,42 @@ def make_request(number: int) -> SDRequest:
         state="Новая",
         multicard_comment_ing="",
     ).with_base_url("https://sd.example.ru")
+
+
+def make_sla_request(
+    number: int,
+    deadline: datetime | None,
+    *,
+    resolved: str | None = None,
+) -> SDRequest:
+    """Заявка с дедлайном СУТС для сценариев SLA."""
+    return SDRequest(
+        sys_id=f"{number:032x}",
+        number=f"REQ{4305000 + number}",
+        short_description=f"SUTSPROD-{17350000 + number}",
+        assigned_user="Иванов И.И.",
+        sys_created_at="01.11.2026 10:00",
+        state="В работе",
+        multicard_comment_ing="",
+        multicard_request_type="Поддержка касс",
+        multicard_name_client="produkty",
+        multicard_terminal_address="Нижний Новгород, пер Камчатский, 7",
+        multicard_deadline=(
+            deadline.strftime("%d.%m.%Y %H:%M") if deadline is not None else None
+        ),
+        resolved_at=resolved,
+        deadline_at=deadline,
+    ).with_base_url("https://sd.example.ru")
+
+
+def seen_store(data_dir: Path, req: SDRequest) -> SDStateStore:
+    """Состояние, в котором заявка уже известна, а SLA-контроль инициализирован."""
+    store = SDStateStore(data_dir)
+    state = store.load()
+    state.mark_seen(req.number, req.sys_id, req.code)
+    state.sla_initialized = True
+    store.save()
+    return store
 
 
 def make_config(data_dir: Path, seed: bool = True) -> Config:
@@ -243,6 +291,217 @@ async def scenario_no_recipients(data_dir: Path) -> None:
     print("  OK: пустой список получателей не роняет мониторинг")
 
 
+async def scenario_sla_warn_once(data_dir: Path) -> None:
+    """В окне 2 ч приходит одно предупреждение с кнопкой и дедлайном."""
+    req = make_sla_request(100, at(18))
+    store = seen_store(data_dir, req)
+    bot = FakeBot()
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+
+    result = await watcher._check_once(now=at(16, 30))
+
+    assert result.sla_warned == 1, f"предупреждение не отправлено: {result}"
+    text = bot.sent[-1][1]
+    assert "До конца SLA 2 ч" in text, f"не тот текст:\n{text}"
+    assert "Дедлайн СУТС:</b> 01.11.2026 18:00" in text
+    assert "Тип:</b> Поддержка касс" in text
+    assert "Клиент:</b> produkty" in text
+    assert store.state.sla_warn_sent == 1
+
+    markup = bot.kwargs[-1].get("reply_markup")
+    assert markup is not None, "нет кнопки «Открыть в SD»"
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "Открыть в SD" and button.url == req.url, (
+        f"кнопка ведёт не туда: {button.text} -> {button.url}"
+    )
+
+    before = len(bot.sent)
+    result = await watcher._check_once(now=at(16, 31))
+    assert len(bot.sent) == before, "предупреждение продублировано"
+    assert result.sla_warned == 0
+    print("  OK: предупреждение за 2 ч приходит один раз, со ссылкой и кнопкой")
+
+
+async def scenario_sla_expired_once(data_dir: Path) -> None:
+    """Просрочка приходит один раз и без запоздалого «осталось 2 ч»."""
+    req = make_sla_request(101, at(18))
+    store = seen_store(data_dir, req)
+    bot = FakeBot()
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+
+    result = await watcher._check_once(now=at(18, 30))
+
+    assert result.sla_expired == 1, f"сообщение о просрочке не отправлено: {result}"
+    text = bot.sent[-1][1]
+    assert "сгорела по SLA" in text, f"не тот текст:\n{text}"
+    assert "Просрочено:</b> 30 мин" in text
+    assert store.state.sla_expired_sent == 1
+    assert store.state.sla_warn_sent == 0, "запоздалое «осталось 2 ч» не нужно"
+
+    before = len(bot.sent)
+    result = await watcher._check_once(now=at(18, 31))
+    assert len(bot.sent) == before, "просрочка продублирована"
+    print("  OK: «сгорела» приходит один раз, даже если предупреждение пропущено")
+
+
+async def scenario_sla_deadline_changed(data_dir: Path) -> None:
+    """Перенос дедлайна в SD запускает новый цикл уведомлений."""
+    req = make_sla_request(102, at(18))
+    store = seen_store(data_dir, req)
+    bot = FakeBot()
+    client = FakeClient([req])
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, client)
+
+    await watcher._check_once(now=at(16, 30))
+    assert store.state.sla_warn_sent == 1
+
+    client.items = [make_sla_request(102, at(20))]
+    before = len(bot.sent)
+    await watcher._check_once(now=at(16, 31))
+    assert len(bot.sent) == before, "по новому сроку предупреждение ещё рано"
+
+    result = await watcher._check_once(now=at(18, 30))
+    assert result.sla_warned == 1, "по новому дедлайну предупреждение не пришло"
+    assert store.state.sla_warn_sent == 2
+    print("  OK: после переноса дедлайна уведомления срабатывают заново")
+
+
+async def scenario_sla_silent_upgrade(data_dir: Path) -> None:
+    """Первое включение SLA на живом боте: одна сводка, без пачки «сгоревших»."""
+    req = make_sla_request(103, at(10))
+    store = SDStateStore(data_dir)
+    state = store.load()
+    state.mark_seen(req.number, req.sys_id, req.code)  # sla_initialized = False
+    store.save()
+
+    bot = FakeBot()
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+
+    result = await watcher._check_once(now=at(12))
+
+    assert result.sla_expired == 0, "не должно быть сообщений о старых просрочках"
+    assert len(bot.sent) == 1, f"ожидали одну сводку, получили {len(bot.sent)}"
+    assert "SLA-контроль включён" in bot.sent[0][1], bot.sent[0][1]
+    assert store.state.sla_initialized is True
+    assert store.state.sla_expired_sent == 0
+
+    before = len(bot.sent)
+    await watcher._check_once(now=at(12, 1))
+    assert len(bot.sent) == before, "после тихой инициализации алерты не нужны"
+    print("  OK: при первом включении SLA тихо берёт сроки под наблюдение")
+
+
+async def scenario_sla_first_run(data_dir: Path) -> None:
+    """Первый запуск: история молчит, но SLA-сводка честная."""
+    req = make_sla_request(104, at(10))
+    bot = FakeBot()
+    watcher = SDWatcher(
+        make_config(data_dir, seed=True), bot, SDStateStore(data_dir), FakeClient([req])
+    )
+
+    result = await watcher._check_once(now=at(12))
+
+    assert result.seeded == 1
+    assert len(bot.sent) == 1, f"ожидали одно сообщение, получили {len(bot.sent)}"
+    text = bot.sent[0][1]
+    assert "SD-мониторинг запущен" in text and "SLA" in text, text
+    assert "сгорела по SLA" not in text, "история не должна литься в чат"
+
+    before = len(bot.sent)
+    await watcher._check_once(now=at(12, 1))
+    assert len(bot.sent) == before
+    print("  OK: первый запуск запоминает сроки молча и присылает одну сводку")
+
+
+async def scenario_sla_new_ticket_no_double(data_dir: Path) -> None:
+    """Новая заявка с уже горящим SLA не даёт два сообщения подряд."""
+    req = make_sla_request(105, at(10))
+    bot = FakeBot()
+    store = SDStateStore(data_dir)
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+
+    result = await watcher._check_once(now=at(12))
+
+    assert result.new_requests and result.sla_expired == 0, f"двойное уведомление: {result}"
+    assert len(bot.sent) == 1 and "Новая заявка" in bot.sent[0][1], bot.sent
+
+    before = len(bot.sent)
+    await watcher._check_once(now=at(12, 1))
+    assert len(bot.sent) == before, "SLA-алерт по новой заявке всё-таки пришёл"
+    assert store.state.sla_expired_sent == 0
+    print("  OK: у новой заявки дедлайн сообщается один раз, без второго алерта")
+
+
+async def scenario_sla_skips_unusable(data_dir: Path) -> None:
+    """Без дедлайна и по закрытым заявкам SLA-сообщений нет."""
+    no_deadline = make_sla_request(106, None)
+    resolved = make_sla_request(107, at(10), resolved="01.11.2026 10:30")
+
+    store = SDStateStore(data_dir)
+    state = store.load()
+    for req in (no_deadline, resolved):
+        state.mark_seen(req.number, req.sys_id, req.code)
+    state.sla_initialized = True
+    store.save()
+
+    bot = FakeBot()
+    watcher = SDWatcher(
+        make_config(data_dir, seed=False),
+        bot,
+        store,
+        FakeClient([no_deadline, resolved]),
+    )
+    result = await watcher._check_once(now=at(12))
+
+    assert not bot.sent, f"лишние сообщения: {bot.sent}"
+    assert result.sla_warned == 0 and result.sla_expired == 0
+    print("  OK: заявки без дедлайна и закрытые под SLA не попадают")
+
+
+async def scenario_sla_retry_after_failure(data_dir: Path) -> None:
+    """Недоставленный SLA-алерт не теряется и не дублируется после успеха."""
+    req = make_sla_request(108, at(10))
+    store = seen_store(data_dir, req)
+    bot = FailingBot()
+    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+
+    await watcher._check_once(now=at(12))
+    assert bot.attempts == 1, f"попыток отправки: {bot.attempts}"
+    assert store.state.sla_expired_sent == 0
+    assert store.state.sla_events[req.sys_id]["expired"] == 0.0, (
+        "недоставленное событие отмечено отправленным — оно потеряно"
+    )
+
+    bot.fails = False
+    result = await watcher._check_once(now=at(12, 1))
+    assert result.sla_expired == 1, "повторная попытка не доставила сообщение"
+    assert store.state.sla_expired_sent == 1
+
+    before = len(bot.sent)
+    await watcher._check_once(now=at(12, 2))
+    assert len(bot.sent) == before, "после доставки сообщение продублировано"
+    print("  OK: при сбое Telegram SLA-алерт повторяется и не дублируется")
+
+
+async def scenario_sla_disabled(data_dir: Path) -> None:
+    """SD_SLA_ENABLED=false отключает авто-алерты, но не ломает проверку."""
+    req = make_sla_request(109, at(10))
+    store = SDStateStore(data_dir)
+    state = store.load()
+    state.mark_seen(req.number, req.sys_id, req.code)
+    store.save()
+    bot = FakeBot()
+    cfg = replace(make_config(data_dir, seed=False), sd_sla_enabled=False)
+    watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
+
+    result = await watcher._check_once(now=at(12))
+
+    assert not bot.sent, f"при выключенном SLA сообщений быть не должно: {bot.sent}"
+    assert result.sla_warned == 0 and result.sla_expired == 0
+    assert store.state.sla_initialized is False, "выключенный SLA не должен инициализироваться"
+    print("  OK: при SD_SLA_ENABLED=false авто-алерты не отправляются")
+
+
 async def main() -> None:
     base = ROOT / ".tmp-test-state"
     print("Проверка логики SD-мониторинга")
@@ -282,6 +541,24 @@ async def main() -> None:
     shutil.rmtree(base, ignore_errors=True)
     base.mkdir(parents=True)
     await scenario_no_recipients(base)
+
+    for title, scenario in (
+        ("SLA: предупреждение", scenario_sla_warn_once),
+        ("SLA: просрочка", scenario_sla_expired_once),
+        ("SLA: перенос дедлайна", scenario_sla_deadline_changed),
+        ("SLA: первое включение", scenario_sla_silent_upgrade),
+        ("SLA: первый запуск", scenario_sla_first_run),
+        ("SLA: новая заявка без дубля", scenario_sla_new_ticket_no_double),
+        ("SLA: неподходящие заявки", scenario_sla_skips_unusable),
+        ("SLA: повтор при сбое", scenario_sla_retry_after_failure),
+        ("SLA: выключен", scenario_sla_disabled),
+    ):
+        print(f"\n[{title}]")
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True)
+        if title == "SLA: повтор при сбое":
+            print("  (ожидаемые ошибки отправки в логе — это часть проверки)")
+        await scenario(base)
 
     shutil.rmtree(base, ignore_errors=True)
     print("\nВсе проверки пройдены.")

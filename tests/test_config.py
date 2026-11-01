@@ -155,7 +155,51 @@ def scenario_ok(tmp: Path) -> None:
         assert cfg.health_port == 8080, f"порт не разобран: {cfg.health_port}"
         assert cfg.sd_check_interval == 10, "минимум интервала не применён"
         assert cfg.llm_api_key == "", "LLM по умолчанию выключен"
+        assert cfg.sd_sla_enabled is True, "SLA-контроль должен быть включён по умолчанию"
+        assert cfg.sd_sla_warn_hours == 2.0, f"порог SLA: {cfg.sd_sla_warn_hours}"
+        assert cfg.sd_timezone == "Europe/Moscow", f"пояс SD: {cfg.sd_timezone}"
         print("  OK: настройки читаются, папка данных создаётся, PORT разбирается")
+    finally:
+        config_module.BASE_DIR = original_base
+        restore_env()
+
+
+def scenario_sla_settings(tmp: Path) -> None:
+    """Порог SLA понимает дробные часы, а опечатка в поясе не проходит молча."""
+    original_base = config_module.BASE_DIR
+    restore_env = with_env(
+        BOT_TOKEN="123456789:AA-test",
+        DATA_DIR=None,
+        PORT=None,
+        SD_SLA_ENABLED="false",
+        SD_SLA_WARN_HOURS="0,5",
+        SD_TIMEZONE="Europe/Moscow",
+    )
+    config_module.BASE_DIR = tmp
+    try:
+        cfg = config_module.load_config()
+        assert cfg.sd_sla_enabled is False, "SD_SLA_ENABLED=false не разобран"
+        assert cfg.sd_sla_warn_hours == 0.5, f"порог: {cfg.sd_sla_warn_hours}"
+        print("  OK: порог SLA понимает дробные часы, флаг выключает контроль")
+    finally:
+        config_module.BASE_DIR = original_base
+        restore_env()
+
+    restore_env = with_env(
+        BOT_TOKEN="123456789:AA-test",
+        DATA_DIR=None,
+        PORT=None,
+        SD_TIMEZONE="Mars/Base",
+    )
+    config_module.BASE_DIR = tmp
+    try:
+        try:
+            config_module.load_config()
+        except ValueError as exc:
+            assert "SD_TIMEZONE" in str(exc), f"ошибка не упоминает пояс: {exc}"
+            print("  OK: неизвестный часовой пояс даёт понятную ошибку при старте")
+        else:
+            raise AssertionError("ожидали ValueError на неизвестном часовом поясе")
     finally:
         config_module.BASE_DIR = original_base
         restore_env()
@@ -204,6 +248,9 @@ def main() -> None:
     print("\n[недоступная DATA_DIR]")
     (base / "bad").mkdir(parents=True, exist_ok=True)
     scenario_bad_data_dir(base / "bad")
+    print("\n[SLA-настройки]")
+    (base / "sla").mkdir(parents=True, exist_ok=True)
+    scenario_sla_settings(base / "sla")
     shutil.rmtree(base, ignore_errors=True)
     print("\nВсе проверки пройдены.")
 
