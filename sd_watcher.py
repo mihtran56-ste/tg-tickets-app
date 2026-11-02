@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import logging
 import time
 from dataclasses import dataclass
@@ -68,6 +69,10 @@ class SDWatcher:
         self._running = False
         self._paused = False
         self._last_result: WatchResult | None = None
+        # Автопауза: считаем неудачные проверки подряд и не шлём уведомление
+        # повторно, пока мониторинг уже стоит на паузе из-за сбоев.
+        self._consecutive_failures = 0
+        self._paused_by_failures = False
 
     @property
     def is_running(self) -> bool:
@@ -83,7 +88,13 @@ class SDWatcher:
 
     def resume(self) -> None:
         self._paused = False
+        self._paused_by_failures = False
+        self._consecutive_failures = 0
         log.info("SD Watcher: возобновлено")
+
+    @property
+    def is_paused_by_failures(self) -> bool:
+        return self._paused_by_failures
 
     async def start(self) -> None:
         """Запускает фоновый цикл проверки."""
@@ -108,7 +119,12 @@ class SDWatcher:
 
     async def _run_loop(self) -> None:
         # Небольшая задержка при старте, чтобы бот успел инициализироваться
-        await asyncio.sleep(5)
+        await asyncio.sleep(max(30, self.cfg.sd_check_interval))
+        state = self.state_store.state
+        if state.last_check:
+            age = time.time() - state.last_check
+            if age < self.cfg.sd_check_interval:
+                await asyncio.sleep(self.cfg.sd_check_interval - age)
 
         while self._running:
             if self._paused:
@@ -119,7 +135,12 @@ class SDWatcher:
             try:
                 result = await self._check_once()
                 self._last_result = result
-                self.state_store.clear_error()
+                if result.errors:
+                    self.state_store.record_error("; ".join(result.errors))
+                    await self._on_failure(result.errors)
+                else:
+                    self.state_store.clear_error()
+                    self._on_success()
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {e}"
                 log.exception("Ошибка в цикле SD Watcher")
@@ -130,11 +151,68 @@ class SDWatcher:
                     errors=[error_msg],
                     duration_ms=int((time.time() - start) * 1000),
                 )
+                await self._on_failure([error_msg])
 
             # Ждём до следующей проверки
             elapsed = time.time() - start
             sleep_time = max(1, self.cfg.sd_check_interval - elapsed)
             await asyncio.sleep(sleep_time)
+
+    def _on_success(self) -> None:
+        if self._consecutive_failures:
+            log.info("SD снова отвечает, счётчик неудач сброшен")
+        self._consecutive_failures = 0
+
+    async def _on_failure(self, errors: list[str]) -> None:
+        # Ручная пауза не должна превращаться в автопаузу: пока мониторинг
+        # остановлен вручную, сбои не копятся, а /sd_status не врёт про «авто».
+        if self._paused and not self._paused_by_failures:
+            return
+        self._consecutive_failures += 1
+        log.warning("Неудачная проверка SD (%d/%d): %s",
+                    self._consecutive_failures, self.cfg.sd_max_failures,
+                    "; ".join(errors))
+        if self._consecutive_failures < self.cfg.sd_max_failures:
+            return
+        if self._paused_by_failures:
+            return
+        self._paused = True
+        self._paused_by_failures = True
+        log.error("SD недоступен %d раз подряд — мониторинг приостановлен. "
+                  "Возобновить: /sd_resume", self._consecutive_failures)
+        if self.cfg.sd_pause_notify:
+            await self._notify_autopause(errors)
+
+    async def _notify_autopause(self, errors: list[str]) -> None:
+        chat_ids = list(self.cfg.sd_notify_chat_ids or self.cfg.allowed_user_ids)
+        if not chat_ids:
+            return
+        reason = errors[-1] if errors else "—"
+        is_auth = "Неверный логин или пароль" in reason
+        if is_auth:
+            hint = ("Проверь SD_LOGIN/SD_PASSWORD в .env. "
+                    "Если пароль меняли — обнови переменную и перезапусти бота.")
+        else:
+            hint = ("Проверь доступность SD (сеть, DNS, сертификат) "
+                    "и настройки SD_BASE_URL.")
+        text = (
+            "⏸ <b>SD-мониторинг приостановлен</b>\n"
+            f"❌ Неудачных проверок подряд: {self._consecutive_failures}\n"
+            f"Причина: {html.escape(reason)}\n\n"
+            f"{hint}\n"
+            "Возобновить: /sd_resume"
+        )
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(chat_id, text, parse_mode="HTML")
+            except TelegramUnauthorizedError:
+                log.error("Бот не авторизован — уведомление об автопаузе не отправлено")
+                break
+            except TelegramNetworkError as exc:
+                log.warning("Сеть Telegram для chat_id=%s: %s", chat_id, exc)
+            except Exception:
+                log.exception("Не удалось отправить уведомление об автопаузе "
+                              "в chat_id=%s", chat_id)
 
     async def _check_once(self, now: datetime | None = None) -> WatchResult:
         """Одна проверка новых заявок и SLA.
@@ -632,6 +710,8 @@ class SDWatcher:
         return {
             "running": self.is_running,
             "paused": self.is_paused,
+            "failures": self._consecutive_failures,
+            "paused_by_failures": self._paused_by_failures,
             "interval_sec": self.cfg.sd_check_interval,
             "last_check": stats["last_check_str"],
             "seen_count": stats["seen_count"],
@@ -667,6 +747,13 @@ class SDWatcher:
 
     async def check_now(self) -> WatchResult:
         """Принудительная проверка прямо сейчас (для команды /sd_test)."""
+        if self._paused:
+            return WatchResult(
+                checked_at=time.time(),
+                new_requests=[],
+                errors=["Мониторинг на паузе — возобнови через /sd_resume"],
+                duration_ms=0,
+            )
         log.info("SD Watcher: принудительная проверка")
         return await self._check_once()
 

@@ -43,6 +43,11 @@ class Config:
     sd_condition: str = ""
     sd_seed_on_first_run: bool = True
     sd_verify_ssl: bool = True
+    # Авторизация в SD: один метод в бою, чтобы не плодить неудачные логины
+    sd_auth_method: str = "simpleone"
+    # После скольких неудачных проверок подряд — автопауза мониторинга
+    sd_max_failures: int = 2
+    sd_pause_notify: bool = True
     # SLA: предупреждение за N часов до дедлайна СУТС и сообщение о просрочке
     sd_sla_enabled: bool = True
     sd_sla_warn_hours: float = 2.0
@@ -155,6 +160,20 @@ def load_config() -> Config:
     except ValueError as exc:
         problems.append(str(exc))
 
+    sd_auth_method = _env("SD_AUTH_METHOD", "simpleone") or "simpleone"
+    if sd_auth_method not in {
+        "simpleone",
+        "api_json",
+        "auth_do",
+        "form",
+        "get_params",
+        "auto",
+    }:
+        problems.append(
+            "SD_AUTH_METHOD: допустимые значения — simpleone, api_json, "
+            "auth_do, form, get_params, auto."
+        )
+
     if problems:
         raise ValueError("\n".join(f"• {problem}" for problem in problems))
 
@@ -188,6 +207,9 @@ def load_config() -> Config:
         sd_condition=_env("SD_CONDITION"),
         sd_seed_on_first_run=_bool_env("SD_SEED_ON_FIRST_RUN", True),
         sd_verify_ssl=_bool_env("SD_VERIFY_SSL", True),
+        sd_auth_method=sd_auth_method,
+        sd_max_failures=_int_env("SD_MAX_FAILURES", 2, 1),
+        sd_pause_notify=_bool_env("SD_PAUSE_NOTIFY", True),
         sd_sla_enabled=_bool_env("SD_SLA_ENABLED", True),
         sd_sla_warn_hours=_float_env("SD_SLA_WARN_HOURS", 2.0, 0.0, 72.0),
         sd_timezone=timezone_name,

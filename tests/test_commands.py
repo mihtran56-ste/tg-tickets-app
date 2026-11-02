@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from aiogram import Dispatcher  # noqa: E402
 
 import sd_commands as sd_commands_module  # noqa: E402
+from access import AccessMiddleware  # noqa: E402
 from config import Config  # noqa: E402
 from sd_client import SDRequest  # noqa: E402
 from sd_commands import pack_blocks, register_sd_commands  # noqa: E402
@@ -48,6 +49,8 @@ class FakeMessage:
 class FakeWatcher:
     def __init__(self, status: dict | None = None, recent: list[str] | None = None) -> None:
         self._paused = False
+        self._paused_by_failures = False
+        self._failures = 0
         self._status = status or {
             "running": True,
             "paused": False,
@@ -66,6 +69,8 @@ class FakeWatcher:
     def get_status(self) -> dict:
         status = dict(self._status)
         status["paused"] = self._paused
+        status["paused_by_failures"] = self._paused_by_failures
+        status["failures"] = self._failures
         return status
 
     def pause(self) -> None:
@@ -73,6 +78,12 @@ class FakeWatcher:
 
     def resume(self) -> None:
         self._paused = False
+        self._paused_by_failures = False
+        self._failures = 0
+
+    @property
+    def is_paused_by_failures(self) -> bool:
+        return self._paused_by_failures
 
     def get_recent_notifications(self, limit: int = 10) -> list[str]:
         self.last_limit = limit
@@ -137,24 +148,78 @@ async def scenario_status_and_pause() -> None:
     assert watcher._paused is True, "пауза не включилась"
     print("  OK: /sd_pause ставит мониторинг на паузу")
 
+    await handlers["cmd_sd_status"](message)
+    assert "(вручную)" in message.last, f"ручная пауза не отмечена: {message.last}"
+    print("  OK: /sd_status различает ручную паузу")
+
     await handlers["cmd_sd_resume"](message)
     assert watcher._paused is False, "мониторинг не возобновился"
     print("  OK: /sd_resume возобновляет мониторинг")
 
 
 async def scenario_permissions() -> None:
-    watcher = FakeWatcher()
-    handlers = handlers_map(make_cfg(), watcher)
+    """Доступ отсекает AccessMiddleware, а не каждый обработчик /sd_*."""
+    cfg = make_cfg()
+    middleware = AccessMiddleware(cfg.allowed_user_ids)
+    called: list[FakeMessage] = []
+
+    async def handler(event: object, _data: dict) -> None:
+        called.append(event)  # type: ignore[arg-type]
+
     stranger = FakeMessage(user_id=555)
+    await middleware(handler, stranger, {})  # type: ignore[arg-type]
+    assert not called, "посторонний прошёл через AccessMiddleware"
+    print("  OK: посторонний не проходит через AccessMiddleware")
 
-    await handlers["cmd_sd_pause"](stranger)
-    assert "Нет прав" in stranger.last, f"чужой не должен ставить паузу: {stranger.last}"
-    assert watcher._paused is False, "чужой всё-таки поставил паузу"
-    print("  OK: чужой пользователь не управляет мониторингом")
+    allowed = FakeMessage(user_id=1001)
+    await middleware(handler, allowed, {})  # type: ignore[arg-type]
+    assert called == [allowed], "разрешённый пользователь не прошёл"
+    print("  OK: разрешённый пользователь проходит через AccessMiddleware")
 
-    await handlers["cmd_sd_count"](stranger)
-    assert "Нет прав" in stranger.last, f"чужой не должен запрашивать количество: {stranger.last}"
-    print("  OK: чужой пользователь не может запросить количество")
+
+async def scenario_autopause_status_and_resume() -> None:
+    """/sd_status показывает автопаузу, /sd_resume её снимает."""
+    watcher = FakeWatcher()
+    watcher._paused = True
+    watcher._paused_by_failures = True
+    watcher._failures = 2
+    handlers = handlers_map(make_cfg(), watcher)
+    message = FakeMessage(user_id=1001)
+
+    await handlers["cmd_sd_status"](message)
+    assert "Пауза: ✅ да (авто: 2 неудач подряд)" in message.last, (
+        f"нет пометки автопаузы: {message.last}"
+    )
+
+    await handlers["cmd_sd_resume"](message)
+    assert "Автопауза после сбоев снята" in message.last, (
+        f"нет сообщения о снятии автопаузы: {message.last}"
+    )
+    assert watcher._paused is False
+    assert watcher._paused_by_failures is False
+    print("  OK: /sd_status и /sd_resume знают про автопаузу")
+
+
+async def scenario_watcher_missing() -> None:
+    """Неполные настройки SD: watcher=None, команды не падают."""
+    handlers = handlers_map(make_cfg(), None)  # type: ignore[arg-type]
+    names = (
+        "cmd_sd_status",
+        "cmd_sd_test",
+        "cmd_sd_last",
+        "cmd_sd_pause",
+        "cmd_sd_resume",
+        "cmd_sd_count",
+        "cmd_sd_dump",
+        "cmd_sd_today",
+    )
+    for name in names:
+        message = FakeMessage(user_id=1001)
+        await handlers[name](message)
+        assert "не запущен" in message.last.lower(), (
+            f"{name}: нет сообщения о неполных настройках: {message.last}"
+        )
+    print("  OK: при watcher=None все /sd_* объясняют, что мониторинг не запущен")
 
 
 async def scenario_disabled() -> None:
@@ -285,8 +350,8 @@ async def scenario_dump_sends_all() -> None:
     print(f"  OK: {len(items)} заявок пришли в {len(parts)} сообщениях, все со ссылками")
 
 
-async def scenario_dump_empty_and_permissions() -> None:
-    """/sd_dump: пустой фильтр и посторонний пользователь."""
+async def scenario_dump_empty() -> None:
+    """/sd_dump: пустой фильтр."""
     watcher = FakeWatcher()
     watcher.client = FakeClient(items=[], total=0)
     handlers = handlers_map(make_cfg(), watcher)
@@ -295,11 +360,6 @@ async def scenario_dump_empty_and_permissions() -> None:
     await handlers["cmd_sd_dump"](message)
     assert "нет заявок" in message.last.lower(), f"пустой фильтр: {message.last}"
     print("  OK: пустой фильтр обрабатывается")
-
-    stranger = FakeMessage(user_id=555)
-    await handlers["cmd_sd_dump"](stranger)
-    assert "Нет прав" in stranger.last, f"посторонний не должен получать список: {stranger.last}"
-    print("  OK: посторонний не может запросить все заявки")
 
 
 async def scenario_split_message() -> None:
@@ -451,13 +511,15 @@ async def main() -> None:
     for title, scenario in (
         ("[статус и пауза]", scenario_status_and_pause),
         ("[права]", scenario_permissions),
+        ("[автопауза в статусе]", scenario_autopause_status_and_resume),
+        ("[неполные настройки SD]", scenario_watcher_missing),
         ("[мониторинг выключен]", scenario_disabled),
         ("[лимит в /sd_last]", scenario_last_limit),
         ("[/sd_test]", scenario_test_command),
         ("[спецсимволы в статусе]", scenario_status_escaping),
         ("[/sd_count без лишнего логина]", scenario_count_reuses_session),
         ("[/sd_dump: все заявки]", scenario_dump_sends_all),
-        ("[/sd_dump: пусто и права]", scenario_dump_empty_and_permissions),
+        ("[/sd_dump: пусто]", scenario_dump_empty),
         ("[разрезание сообщений]", scenario_split_message),
         ("[/sd_today]", scenario_sd_today),
         ("[нарезка карточек]", scenario_pack_blocks),

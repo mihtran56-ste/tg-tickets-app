@@ -143,6 +143,9 @@ def scenario_ok(tmp: Path) -> None:
         DATA_DIR=None,
         PORT="8080",
         SD_CHECK_INTERVAL="5",
+        SD_AUTH_METHOD=None,
+        SD_MAX_FAILURES=None,
+        SD_PAUSE_NOTIFY=None,
     )
     config_module.BASE_DIR = tmp
     try:
@@ -155,10 +158,58 @@ def scenario_ok(tmp: Path) -> None:
         assert cfg.health_port == 8080, f"порт не разобран: {cfg.health_port}"
         assert cfg.sd_check_interval == 10, "минимум интервала не применён"
         assert cfg.llm_api_key == "", "LLM по умолчанию выключен"
+        assert cfg.sd_auth_method == "simpleone", f"метод входа по умолчанию: {cfg.sd_auth_method}"
+        assert cfg.sd_max_failures == 2, f"порог неудач по умолчанию: {cfg.sd_max_failures}"
+        assert cfg.sd_pause_notify is True, "уведомление об автопаузе должно быть включено"
         assert cfg.sd_sla_enabled is True, "SLA-контроль должен быть включён по умолчанию"
         assert cfg.sd_sla_warn_hours == 2.0, f"порог SLA: {cfg.sd_sla_warn_hours}"
         assert cfg.sd_timezone == "Europe/Moscow", f"пояс SD: {cfg.sd_timezone}"
         print("  OK: настройки читаются, папка данных создаётся, PORT разбирается")
+    finally:
+        config_module.BASE_DIR = original_base
+        restore_env()
+
+
+def scenario_auth_settings(tmp: Path) -> None:
+    """SD_AUTH_METHOD и SD_MAX_FAILURES: значения, минимум и опечатки."""
+    original_base = config_module.BASE_DIR
+    config_module.BASE_DIR = tmp
+    restore_env = with_env(
+        BOT_TOKEN="123456789:AA-test",
+        DATA_DIR=None,
+        PORT=None,
+        SD_AUTH_METHOD="auto",
+        SD_MAX_FAILURES="0",
+        SD_PAUSE_NOTIFY="false",
+    )
+    try:
+        cfg = config_module.load_config()
+        assert cfg.sd_auth_method == "auto", f"метод: {cfg.sd_auth_method}"
+        assert cfg.sd_max_failures == 1, f"минимум порога не применён: {cfg.sd_max_failures}"
+        assert cfg.sd_pause_notify is False, "SD_PAUSE_NOTIFY=false не разобран"
+        print("  OK: SD_AUTH_METHOD, минимум SD_MAX_FAILURES и флаг уведомления работают")
+    finally:
+        config_module.BASE_DIR = original_base
+        restore_env()
+
+    restore_env = with_env(
+        BOT_TOKEN="123456789:AA-test",
+        DATA_DIR=None,
+        PORT=None,
+        SD_AUTH_METHOD="login_v2",
+        SD_MAX_FAILURES=None,
+        SD_PAUSE_NOTIFY=None,
+    )
+    config_module.BASE_DIR = tmp
+    try:
+        try:
+            config_module.load_config()
+        except ValueError as exc:
+            assert "SD_AUTH_METHOD:" in str(exc), f"ошибка не упоминает метод: {exc}"
+            assert "get_params" in str(exc), f"нет списка допустимых значений: {exc}"
+            print("  OK: неверный SD_AUTH_METHOD отклоняется с понятным текстом")
+        else:
+            raise AssertionError("ожидали ValueError на неизвестном SD_AUTH_METHOD")
     finally:
         config_module.BASE_DIR = original_base
         restore_env()
@@ -251,6 +302,9 @@ def main() -> None:
     print("\n[SLA-настройки]")
     (base / "sla").mkdir(parents=True, exist_ok=True)
     scenario_sla_settings(base / "sla")
+    print("\n[авторизация SD]")
+    (base / "auth").mkdir(parents=True, exist_ok=True)
+    scenario_auth_settings(base / "auth")
     shutil.rmtree(base, ignore_errors=True)
     print("\nВсе проверки пройдены.")
 

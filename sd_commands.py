@@ -89,12 +89,23 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен (SD_ENABLED=false в .env)")
             return
 
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
+            return
+
         status = watcher.get_status()
 
+        pause_note = ""
+        if status.get("paused_by_failures"):
+            pause_note = f" (авто: {status.get('failures', 0)} неудач подряд)"
+        elif status["paused"]:
+            pause_note = " (вручную)"
         lines = [
             "📊 <b>Статус SD-мониторинга</b>",
             f"🔄 Работает: {'✅ да' if status['running'] else '❌ нет'}",
-            f"⏸ Пауза: {'✅ да' if status['paused'] else '❌ нет'}",
+            f"⏸ Пауза: {'✅ да' if status['paused'] else '❌ нет'}{pause_note}",
             f"⏱ Интервал: {_esc(status['interval_sec'])} сек",
             f"🕒 Последняя проверка: {_esc(status['last_check'])}",
             f"👁 Видано заявок: {_esc(status['seen_count'])}",
@@ -140,9 +151,10 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        # Проверяем права доступа (только админы/владельцы)
-        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
-            await message.answer("⛔ Нет прав для этой команды")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
             return
 
         await message.answer("🔄 Проверяю SD...")
@@ -187,6 +199,12 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
+            return
+
         raw = (message.text or "").partition(" ")[2].strip()
         try:
             limit = int(raw) if raw else 10
@@ -211,8 +229,10 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
-            await message.answer("⛔ Нет прав для этой команды")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
             return
 
         watcher.pause()
@@ -225,12 +245,18 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
-            await message.answer("⛔ Нет прав для этой команды")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
             return
 
+        was_auto = watcher.is_paused_by_failures
         watcher.resume()
-        await message.answer("▶️ SD-мониторинг возобновлён.")
+        text = "▶️ SD-мониторинг возобновлён."
+        if was_auto:
+            text += " Автопауза после сбоев снята, счётчик неудач обнулён."
+        await message.answer(text)
 
     @dp.message(Command("sd_count"))
     async def cmd_sd_count(message: Message) -> None:
@@ -239,30 +265,27 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
-            await message.answer("⛔ Нет прав для этой команды")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
+            return
+
+        # Переиспользуем сессию монитора: новый клиент означал бы лишний
+        # логин в ServiceDesk на каждый вызов команды.
+        client = getattr(watcher, "client", None)
+        if client is None:
+            await message.answer(
+                "⚠️ SD-клиент недоступен — мониторинг не запущен.")
             return
 
         await message.answer("🔄 Проверяю количество...")
         try:
-            # Переиспользуем сессию монитора: новый клиент означал бы лишний
-            # логин в ServiceDesk на каждый вызов команды.
-            client = getattr(watcher, "client", None)
-            if client is not None:
-                requests, total = await client.fetch_requests(
-                    view=cfg.sd_view,
-                    condition=cfg.sd_condition,
-                    limit=1,
-                )
-            else:
-                from sd_client import SDClient
-
-                async with SDClient(cfg) as temporary:
-                    requests, total = await temporary.fetch_requests(
-                        view=cfg.sd_view,
-                        condition=cfg.sd_condition,
-                        limit=1,
-                    )
+            requests, total = await client.fetch_requests(
+                view=cfg.sd_view,
+                condition=cfg.sd_condition,
+                limit=1,
+            )
             await message.answer(
                 f"📊 <b>Заявок по фильтру: {total}</b>\n"
                 f"(показано первых: {len(requests)})",
@@ -278,19 +301,21 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        if message.from_user and message.from_user.id not in cfg.allowed_user_ids:
-            await message.answer("⛔ Нет прав для этой команды")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
+            return
+
+        client = getattr(watcher, "client", None)
+        if client is None:
+            await message.answer(
+                "⚠️ SD-клиент недоступен — мониторинг не запущен.")
             return
 
         await message.answer("🔄 Загружаю все заявки по фильтру...")
 
-        client = getattr(watcher, "client", None)
-        own_client = client is None
         try:
-            if own_client:
-                from sd_client import SDClient
-
-                client = SDClient(cfg)
             items, total = await client.fetch_requests(
                 view=cfg.sd_view,
                 condition=cfg.sd_condition,
@@ -299,9 +324,6 @@ def register_sd_commands(
         except Exception as e:
             await message.answer(f"❌ Не удалось получить заявки: {type(e).__name__}: {e}")
             return
-        finally:
-            if own_client and client is not None:
-                await client.close()
 
         if not items:
             await message.answer("📭 По фильтру сейчас нет заявок.")
@@ -324,17 +346,23 @@ def register_sd_commands(
             await message.answer("⚠️ SD-мониторинг отключен")
             return
 
-        await message.answer("🔄 Смотрю дедлайны на сегодня...")
+        if watcher is None:
+            await message.answer(
+                "⚠️ SD-мониторинг не запущен: неполные настройки "
+                "(SD_BASE_URL, SD_LOGIN, SD_PASSWORD, SD_CONDITION)")
+            return
 
         # Переиспользуем сессию монитора, как /sd_count и /sd_dump: иначе
         # каждая команда делала бы лишний логин в ServiceDesk.
         client = getattr(watcher, "client", None)
-        own_client = client is None
-        try:
-            if own_client:
-                from sd_client import SDClient
+        if client is None:
+            await message.answer(
+                "⚠️ SD-клиент недоступен — мониторинг не запущен.")
+            return
 
-                client = SDClient(cfg)
+        await message.answer("🔄 Смотрю дедлайны на сегодня...")
+
+        try:
             items, _total = await client.fetch_requests(
                 view=cfg.sd_view,
                 condition=cfg.sd_condition,
@@ -343,9 +371,6 @@ def register_sd_commands(
         except Exception as e:
             await message.answer(f"❌ Не удалось получить заявки: {type(e).__name__}: {e}")
             return
-        finally:
-            if own_client and client is not None:
-                await client.close()
 
         moment = now_in(cfg.sd_timezone)
         blocks = today_blocks(items, moment, cfg.sd_timezone)

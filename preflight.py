@@ -73,6 +73,18 @@ def config_checks(cfg: Config) -> list[Check]:
         )
     )
 
+    method_ok = cfg.sd_auth_method in {
+        "simpleone", "api_json", "auth_do", "form", "get_params", "auto"}
+    checks.append(Check(
+        "SD_AUTH_METHOD",
+        method_ok and cfg.sd_auth_method != "auto",
+        f"{cfg.sd_auth_method}" + (
+            " — перебор 5 методов при каждом логине; "
+            "зафиксируй рабочий метод для боевого режима"
+            if cfg.sd_auth_method == "auto" else " (зафиксирован)"),
+        critical=False,
+    ))
+
     try:
         port_ok = 0 <= cfg.health_port <= 65535
     except TypeError:

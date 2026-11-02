@@ -344,6 +344,9 @@ class SDClient:
         self._logged_in = False
         self._auth_key: str | None = None
         self._login_lock = asyncio.Lock()
+        # Один релогин на вызов fetch_requests: не устраиваем серию неудачных
+        # логинов при истёкшей сессии (это видно службе безопасности SD).
+        self._relogin_attempted = False
         # Рабочий эндпоинт, найденный ранее — чтобы не перебирать все заново
         self._working_endpoint: str | None = None
         # Поддерживает ли сервер постраничную выдачу (проверяем один раз)
@@ -378,76 +381,113 @@ class SDClient:
             await self.session.close()
         self._logged_in = False
 
-    async def login(self) -> bool:
-        """Авторизация в SD через форму логина."""
+    def _auth_methods(self) -> dict:
+        """Все способы входа: имя из SD_AUTH_METHOD -> метод."""
+        return {
+            "simpleone": self._login_via_simpleone_api,
+            "api_json": self._login_via_api_json,
+            "auth_do": self._login_via_auth_do,
+            "form": self._login_via_form,
+            "get_params": self._login_via_get_params,
+        }
+
+    async def login(self) -> tuple[bool, str]:
+        """Авторизация в SD выбранным методом (SD_AUTH_METHOD).
+
+        Возвращает (успех, причина). Причина "auth" означает явный отказ в
+        учётных данных: дальше стучаться нельзя, иначе в SD копится серия
+        неудачных логинов под личной учёткой.
+        """
         async with self._login_lock:
             if self._logged_in:
-                return True
-
+                return True, ""
             await self._ensure_session()
-            assert self.session is not None
 
-            # Пробуем разные способы авторизации по порядку
-            methods = [
-                self._login_via_simpleone_api,
-                self._login_via_api_json,
-                self._login_via_auth_do,
-                self._login_via_form,
-                self._login_via_get_params,
-            ]
+            methods = self._auth_methods()
+            if self.cfg.sd_auth_method == "auto":
+                order = list(methods.values())
+            else:
+                chosen = methods.get(self.cfg.sd_auth_method)
+                if chosen is None:
+                    return False, f"неизвестный SD_AUTH_METHOD: {self.cfg.sd_auth_method}"
+                order = [chosen]
 
-            for method in methods:
+            last_reason = "unknown"
+            for method in order:
                 try:
-                    if await method():
-                        return True
-                except Exception:
-                    log.debug("Метод %s не сработал", method.__name__, exc_info=True)
+                    ok, reason = await method()
+                except asyncio.TimeoutError:
+                    last_reason = "таймаут соединения (SD не ответил за 30 с)"
+                    log.debug("Метод %s: таймаут", method.__name__)
+                    continue
+                # ClientSSLError — подкласс ClientConnectorError, поэтому
+                # проверяем TLS раньше: иначе причина «ошибка TLS» недостижима.
+                except aiohttp.ClientSSLError as exc:
+                    last_reason = f"ошибка TLS: {exc}"
+                    log.debug("Метод %s: ssl error", method.__name__)
+                    continue
+                except aiohttp.ClientConnectorError as exc:
+                    last_reason = f"не удалось подключиться: {exc}"
+                    log.debug("Метод %s: connector error", method.__name__)
+                    continue
+                except Exception as exc:
+                    text = str(exc).strip()
+                    last_reason = (f"{type(exc).__name__}: {text}"
+                                   if text else type(exc).__name__)
+                    log.debug("Метод %s упал: %s", method.__name__, last_reason)
+                    continue
 
-            log.error("Все методы авторизации не сработали")
-            return False
+                if ok:
+                    return True, ""
+                last_reason = reason or "unknown"
+                if reason == "auth":
+                    # Неверный пароль — дальше стучаться нет смысла
+                    return False, "auth"
+            return False, last_reason
 
-    async def _login_via_api_json(self) -> bool:
+    async def _login_via_api_json(self) -> tuple[bool, str]:
         """JSON API авторизация: /api/now/auth/login (ServiceNow style)."""
         assert self.session is not None
         auth_url = urljoin(self.base_url, "/api/now/auth/login")
         async with self.session.post(auth_url, json={"username": self._login, "password": self._password}) as resp:
             log.info("POST %s -> HTTP %s", auth_url, resp.status)
+            if resp.status == 401:
+                return False, "auth"
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("result", {}).get("session_id"):
                     self._logged_in = True
                     log.info("Успешная авторизация через /api/now/auth/login")
-                    return True
-            return False
+                    return True, ""
+                return False, "session_id не найден в ответе"
+            return False, f"HTTP {resp.status}"
 
-    async def _login_via_simpleone_api(self) -> bool:
+    async def _login_via_simpleone_api(self) -> tuple[bool, str]:
         """SimpleOne API авторизация: /v1/auth/login."""
         assert self.session is not None
         auth_url = urljoin(self.base_url, "/v1/auth/login")
         payload = {"username": self._login, "password": self._password}
 
-        try:
-            async with self.session.post(auth_url, json=payload) as resp:
-                log.info("POST %s -> HTTP %s", auth_url, resp.status)
-                text = await resp.text()
-                log.info("RAW ответ от %s: %s", auth_url, redact_secrets(text[:500]))
-                if resp.status == 200:
-                    data = json.loads(text)
-                    # Ищем auth_key в ответе
-                    auth_key = data.get("data", {}).get("auth_key")
-                    if auth_key:
-                        self._auth_key = auth_key
-                        self._logged_in = True
-                        log.info("Успешная авторизация через /v1/auth/login, auth_key получен")
-                        return True
-                    log.warning("auth_key не найден в ответе: %s", redact_secrets(str(data)))
-                elif resp.status == 401:
-                    return False
-        except Exception:
-            log.exception("Ошибка при авторизации через /v1/auth/login")
-        return False
+        async with self.session.post(auth_url, json=payload) as resp:
+            log.info("POST %s -> HTTP %s", auth_url, resp.status)
+            text = await resp.text()
+            log.info("RAW ответ от %s: %s", auth_url, redact_secrets(text[:500]))
+            if resp.status == 401:
+                return False, "auth"
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}"
+            data = json.loads(text)
+            # Ищем auth_key в ответе
+            auth_key = data.get("data", {}).get("auth_key")
+            if auth_key:
+                self._auth_key = auth_key
+                self._logged_in = True
+                log.info("Успешная авторизация через /v1/auth/login, auth_key получен")
+                return True, ""
+            log.warning("auth_key не найден в ответе: %s", redact_secrets(str(data)))
+            return False, "auth_key не найден в ответе"
 
-    async def _login_via_auth_do(self) -> bool:
+    async def _login_via_auth_do(self) -> tuple[bool, str]:
         """Альтернативный эндпоинт: /auth.do."""
         assert self.session is not None
         auth_url = urljoin(self.base_url, "/auth.do")
@@ -458,15 +498,18 @@ class SDClient:
         }
         async with self.session.post(auth_url, data=payload) as resp:
             log.info("POST %s -> HTTP %s", auth_url, resp.status)
+            if resp.status == 401:
+                return False, "auth"
             if resp.status in (200, 302):
                 text = await resp.text()
                 if "logout" in text.lower() or "sign out" in text.lower() or resp.status == 302:
                     self._logged_in = True
                     log.info("Успешная авторизация через /auth.do")
-                    return True
-            return False
+                    return True, ""
+                return False, "auth"
+            return False, f"HTTP {resp.status}"
 
-    async def _login_via_form(self) -> bool:
+    async def _login_via_form(self) -> tuple[bool, str]:
         """Стандартная форма логина: GET /login.do + POST на action из формы."""
         assert self.session is not None
 
@@ -474,48 +517,56 @@ class SDClient:
         login_page_url = urljoin(self.base_url, "/login.do")
         async with self.session.get(login_page_url) as resp:
             log.info("GET %s -> HTTP %s", login_page_url, resp.status)
+            if resp.status == 401:
+                return False, "auth"
             if resp.status != 200:
-                return False
-            html = await resp.text()
+                return False, f"HTTP {resp.status}"
+            login_page = await resp.text()
 
         # DEBUG: сохраняем HTML для анализа (не критично для работы — не роняем логин)
         try:
             debug_path = self.cfg.data_dir / "login_page.html"
             debug_path.parent.mkdir(parents=True, exist_ok=True)
-            debug_path.write_text(html, encoding="utf-8")
-            log.info("HTML страницы логина сохранён: %s (%d байт)", debug_path, len(html))
+            debug_path.write_text(login_page, encoding="utf-8")
+            log.info("HTML страницы логина сохранён: %s (%d байт)", debug_path, len(login_page))
         except OSError as exc:
             log.debug("Не удалось сохранить HTML страницы логина: %s", exc)
 
         # Извлекаем user_token (CSRF)
-        match = USER_TOKEN_RE.search(html)
+        match = USER_TOKEN_RE.search(login_page)
         user_token = match.group(1) if match else ""
-        log.debug("user_token: %s", user_token[:20] + "..." if user_token else "не найден")
+        if not user_token:
+            log.debug("user_token не найден на странице логина")
+            return False, "user_token не найден на странице логина"
+        log.debug("user_token: %s", user_token[:20] + "...")
 
         # Извлекаем action формы логина
-        form_action = self._extract_form_action(html)
+        form_action = self._extract_form_action(login_page)
         log.info("Form action: %s", form_action)
+        if not form_action:
+            return False, "форма логина не найдена"
 
         # 2. POST логин на правильный URL
-        login_url = urljoin(self.base_url, form_action) if form_action else urljoin(self.base_url, "/login.do")
+        login_url = urljoin(self.base_url, form_action)
         payload = {
             "user_name": self._login,
             "user_password": self._password,
             "remember_me": "true",
+            "user_token": user_token,
         }
-        if user_token:
-            payload["user_token"] = user_token
 
         async with self.session.post(login_url, data=payload) as resp:
             log.info("POST %s -> HTTP %s", login_url, resp.status)
+            if resp.status == 401:
+                return False, "auth"
             if resp.status not in (200, 302):
-                return False
+                return False, f"HTTP {resp.status}"
             text = await resp.text()
             if "logout" in text.lower() or "sign out" in text.lower() or resp.status == 302:
                 self._logged_in = True
                 log.info("Успешная авторизация через форму")
-                return True
-            return False
+                return True, ""
+            return False, "auth"
 
     def _extract_form_action(self, html: str) -> str | None:
         """Извлекает action из формы логина."""
@@ -530,7 +581,7 @@ class SDClient:
             return match.group(1)
         return None
 
-    async def _login_via_get_params(self) -> bool:
+    async def _login_via_get_params(self) -> tuple[bool, str]:
         """GET с параметрами: /login.do?user_name=...&user_password=..."""
         assert self.session is not None
         auth_url = urljoin(self.base_url, "/login.do")
@@ -541,13 +592,16 @@ class SDClient:
         }
         async with self.session.get(auth_url, params=params) as resp:
             log.info("GET %s -> HTTP %s", auth_url, resp.status)
+            if resp.status == 401:
+                return False, "auth"
             if resp.status in (200, 302):
                 text = await resp.text()
                 if "logout" in text.lower() or "sign out" in text.lower() or resp.status == 302:
                     self._logged_in = True
                     log.info("Успешная авторизация через GET параметры")
-                    return True
-            return False
+                    return True, ""
+                return False, "auth"
+            return False, f"HTTP {resp.status}"
 
     async def fetch_requests(
         self,
@@ -561,8 +615,15 @@ class SDClient:
         Returns:
             tuple: (список заявок, общее количество по фильтру)
         """
-        if not await self.login():
-            raise RuntimeError("Не удалось авторизоваться в SD")
+        # Новый вызов — новая попытка релогина: не больше одной на проверку.
+        self._relogin_attempted = False
+
+        ok, reason = await self.login()
+        if not ok:
+            if reason == "auth":
+                raise RuntimeError(
+                    "Неверный логин или пароль SD (SD_LOGIN/SD_PASSWORD)")
+            raise RuntimeError(f"SD недоступен: {reason}")
 
         await self._ensure_session()
         assert self.session is not None
@@ -658,8 +719,14 @@ class SDClient:
                         log.warning("Сессия истекла (401/403), пробуем релогин")
                         self._logged_in = False
                         self._auth_key = None
-                        if retry and await self._login():
-                            return await _fetch_page(endpoint, default_params, page_number, retry=False)
+                        if retry and not self._relogin_attempted:
+                            self._relogin_attempted = True
+                            ok, reason = await self.login()
+                            if ok:
+                                return await _fetch_page(endpoint, default_params,
+                                                         page_number, retry=False)
+                            raise RuntimeError(
+                                f"Сессия истекла, релогин не удался: {reason}")
                         last_error = f"HTTP {resp.status}"
                         return None
 

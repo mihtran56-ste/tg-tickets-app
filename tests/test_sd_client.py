@@ -20,6 +20,150 @@ from sd_client import SDClient, redact_secrets  # noqa: E402
 KEY = "af152c000d93405646fa5f3213caf48a1483a1cb5bea6b04b840a30c6c151ebe"
 
 
+class FakeResponse:
+    """Ответ aiohttp, который можно использовать через async with."""
+
+    def __init__(self, status: int = 200, text: str = "", json_data=None) -> None:
+        self.status = status
+        self._text = text
+        self._json = json_data
+
+    async def __aenter__(self) -> "FakeResponse":
+        return self
+
+    async def __aexit__(self, *_args: object) -> bool:
+        return False
+
+    async def text(self) -> str:
+        return self._text
+
+    async def json(self):
+        return self._json
+
+
+class FakeSession:
+    """Подменяет aiohttp.ClientSession и записывает запросы."""
+
+    def __init__(
+        self,
+        post_response: FakeResponse | None = None,
+        get_response: FakeResponse | None = None,
+        post_error: Exception | None = None,
+    ) -> None:
+        self.closed = False
+        self.calls: list[tuple[str, str, dict]] = []
+        self.post_response = post_response or FakeResponse()
+        self.get_response = get_response or FakeResponse()
+        self.post_error = post_error
+
+    def post(self, url: str, **kwargs: object) -> FakeResponse:
+        self.calls.append(("POST", url, kwargs))
+        if self.post_error is not None:
+            raise self.post_error
+        return self.post_response
+
+    def get(self, url: str, **kwargs: object) -> FakeResponse:
+        self.calls.append(("GET", url, kwargs))
+        return self.get_response
+
+
+def make_client_cfg(**overrides: object) -> Config:
+    base: dict[str, object] = {
+        "bot_token": "1:x",
+        "allowed_user_ids": frozenset({1}),
+        "data_dir": ROOT,
+        "sd_enabled": True,
+        "sd_base_url": "https://sd.example.ru",
+        "sd_login": "ivanov",
+        "sd_password": "secret",
+        "sd_condition": "state=1",
+        "sd_auth_method": "simpleone",
+    }
+    base.update(overrides)
+    return Config(**base)  # type: ignore[arg-type]
+
+
+def auth_ok() -> FakeResponse:
+    return FakeResponse(200, '{"data":{"auth_key":"test-auth-key"}}')
+
+
+async def scenario_single_auth_method() -> None:
+    """SD_AUTH_METHOD=simpleone: ровно один POST к /v1/auth/login."""
+    client = SDClient(make_client_cfg())
+    session = FakeSession(post_response=auth_ok())
+    client.session = session  # type: ignore[assignment]
+
+    ok, reason = await client.login()
+
+    assert (ok, reason) == (True, "")
+    assert len(session.calls) == 1, f"лишние запросы при входе: {session.calls}"
+    method, url, _kwargs = session.calls[0]
+    assert method == "POST"
+    assert url.endswith("/v1/auth/login"), f"не тот эндпоинт: {url}"
+    print("  OK: simpleone делает ровно один POST /v1/auth/login")
+
+
+async def scenario_401_stops_auto() -> None:
+    """401 при auto: (False, "auth") и никаких других методов."""
+    client = SDClient(make_client_cfg(sd_auth_method="auto"))
+    session = FakeSession(post_response=FakeResponse(401, ""))
+    client.session = session  # type: ignore[assignment]
+
+    ok, reason = await client.login()
+
+    assert (ok, reason) == (False, "auth"), f"получили ({ok}, {reason})"
+    assert len(session.calls) == 1, (
+        f"после 401 были ещё попытки входа: {session.calls}"
+    )
+    print("  OK: 401 останавливает перебор методов даже при auto")
+
+
+async def scenario_timeout() -> None:
+    """Таймаут: login объясняет причину, fetch_requests — «SD недоступен»."""
+    client = SDClient(make_client_cfg())
+    session = FakeSession(post_error=asyncio.TimeoutError())
+    client.session = session  # type: ignore[assignment]
+
+    ok, reason = await client.login()
+
+    assert ok is False
+    assert reason.startswith("таймаут соединения"), f"причина: {reason}"
+
+    try:
+        await client.fetch_requests(view="Default", condition="state=1", limit=10)
+    except RuntimeError as exc:
+        text = str(exc)
+        assert "SD недоступен:" in text, f"не тот текст ошибки: {text}"
+        assert "таймаут соединения" in text, f"причина потерялась: {text}"
+    else:
+        raise AssertionError("ожидали RuntimeError при таймауте")
+    print("  OK: таймаут различается и доходит до RuntimeError «SD недоступен»")
+
+
+async def scenario_one_relogin_per_fetch() -> None:
+    """401 в fetch_requests: не больше одного релогина за вызов."""
+    client = SDClient(make_client_cfg())
+    session = FakeSession(
+        post_response=auth_ok(),
+        get_response=FakeResponse(401, ""),
+    )
+    client.session = session  # type: ignore[assignment]
+
+    try:
+        await client.fetch_requests(view="Default", condition="state=1", limit=10)
+    except RuntimeError as exc:
+        assert "Все эндпоинты" in str(exc), f"не та ошибка: {exc}"
+    else:
+        raise AssertionError("ожидали RuntimeError: все эндпоинты вернули 401")
+
+    posts = [call for call in session.calls if call[0] == "POST"]
+    assert len(posts) == 2, (
+        f"логинов за вызов: {len(posts)} (ожидали 1 вход + 1 релогин)"
+    )
+    print("  OK: fetch_requests при 401 делает ровно один релогин")
+
+
+
 def scenario_json_key() -> None:
     """Ключ из JSON-ответа авторизации скрывается, остальное остаётся."""
     raw = (
@@ -112,6 +256,15 @@ async def main() -> None:
 
     print("\n[проверка сертификата]")
     await scenario_ssl_verification()
+
+    print("\n[один метод авторизации]")
+    await scenario_single_auth_method()
+    print("\n[401 останавливает перебор]")
+    await scenario_401_stops_auto()
+    print("\n[таймаут]")
+    await scenario_timeout()
+    print("\n[один релогин на вызов]")
+    await scenario_one_relogin_per_fetch()
     print("\nВсе проверки пройдены.")
 
 
