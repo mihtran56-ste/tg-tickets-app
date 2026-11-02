@@ -17,6 +17,8 @@ from sd_client import SDRequest  # noqa: E402
 from sd_sla import (  # noqa: E402
     SLA_EXPIRED,
     SLA_WARN,
+    digest_line,
+    format_digest,
     format_sla_notification,
     human_left,
     resolve_timezone,
@@ -183,6 +185,29 @@ def scenario_today_timezone() -> None:
     print("  OK: «сегодня» считается по часовому поясу SD, а не сервера")
 
 
+def scenario_digest() -> None:
+    """Дайджест: ссылки, дата создания, дедлайн и ограничение строк."""
+    first = make_req(40, at(hour=18), code="SUTSPROD-10001")
+    second = make_req(41, at(day=2, hour=10), code="SUTSPROD-10002")
+    no_deadline = make_req(42, None, code="SUTSPROD-10003")
+
+    text = format_digest(
+        [first, second, no_deadline], "Пропущенные заявки", "Europe/Moscow", limit=2
+    )
+
+    assert text.startswith("🆕 <b>Пропущенные заявки: 3</b>"), f"заголовок:\n{text}"
+    assert "SUTSPROD-10001" in text and "SUTSPROD-10002" in text
+    assert "создана 01.11.2026 10:00" in text
+    assert "дедлайн 01.11.2026 18:00" in text
+    assert "… и ещё 1 — /sd_dump" in text, f"нет пометки об остатке:\n{text}"
+    assert 'href="https://sd.example.ru/record/itsm_request/' in text
+
+    line = digest_line(no_deadline, "Europe/Moscow")
+    assert "дедлайн —" in line, f"пустой дедлайн:\n{line}"
+    assert format_digest([], "Пусто", "Europe/Moscow") == ""
+    print("  OK: дайджест показывает ссылки, даты и остаток, пустой не создаётся")
+
+
 def scenario_empty_today() -> None:
     blocks = today_blocks([make_req(30, at(day=3, hour=9))], at(hour=12), "Europe/Moscow")
     assert "— 0" in blocks[0], f"заголовок пустого отчёта: {blocks[0]!r}"
@@ -210,6 +235,7 @@ def main() -> None:
         ("[экранирование]", scenario_escaping),
         ("[пустые поля]", scenario_missing_fields),
         ("[отчёт «сегодня»]", scenario_today_report),
+        ("[дайджест]", scenario_digest),
         ("[пояс SD в отчёте]", scenario_today_timezone),
         ("[пустой отчёт]", scenario_empty_today),
         ("[неизвестная зона]", scenario_bad_timezone),

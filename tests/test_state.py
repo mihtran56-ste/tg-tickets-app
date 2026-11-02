@@ -205,6 +205,36 @@ def scenario_old_state_without_sla(tmp: Path) -> None:
     print("  OK: старый файл состояния без SLA читается как есть")
 
 
+def scenario_filter_signature(tmp: Path) -> None:
+    """Подпись фильтра сохраняется, старый файл без неё читается."""
+    store = SDStateStore(fresh(tmp / "sig"))
+    state = store.load()
+    state.filter_signature = "abc123def456"
+    state.mark_seen("REQ1", "a1")
+    store.save()
+
+    reloaded = SDStateStore(store.path.parent).load()
+    assert reloaded.filter_signature == "abc123def456", "подпись фильтра не сохранилась"
+
+    old_dir = fresh(tmp / "sig_old")
+    (old_dir / "sd_state.json").write_text(
+        json.dumps({"last_check": 1.0, "seen_numbers": ["REQ1"], "seen_sys_ids": ["a1"]}),
+        encoding="utf-8",
+    )
+    old = SDStateStore(old_dir).load()
+    assert old.filter_signature == "", "старый файл должен читаться с пустой подписью"
+    assert old.seen_numbers == ["REQ1"], "история потерялась"
+
+    bad_dir = fresh(tmp / "sig_bad")
+    (bad_dir / "sd_state.json").write_text(
+        json.dumps({"filter_signature": 5}), encoding="utf-8"
+    )
+    broken = SDStateStore(bad_dir)
+    assert broken.load().seen_numbers == [], "неверный тип подписи должен откладывать файл"
+    assert list(bad_dir.glob("sd_state.json.corrupt-*")), "повреждённый файл не сохранён"
+    print("  OK: подпись фильтра сохраняется, старый файл совместим")
+
+
 def scenario_atomic_save(tmp: Path) -> None:
     data_dir = fresh(tmp / "atomic")
     store = SDStateStore(data_dir)
@@ -227,6 +257,7 @@ def main() -> None:
         ("[состояние SLA]", lambda: scenario_sla_state(base)),
         ("[чистка SLA]", lambda: scenario_sla_prune()),
         ("[старый файл без SLA]", lambda: scenario_old_state_without_sla(base)),
+        ("[подпись фильтра]", lambda: scenario_filter_signature(base)),
         ("[атомарность]", lambda: scenario_atomic_save(base)),
     ):
         print(f"\n{title}")

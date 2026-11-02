@@ -98,9 +98,16 @@ def register_sd_commands(
             f"⏱ Интервал: {_esc(status['interval_sec'])} сек",
             f"🕒 Последняя проверка: {_esc(status['last_check'])}",
             f"👁 Видано заявок: {_esc(status['seen_count'])}",
+        ]
+
+        last = status.get("last_result") or {}
+        if last.get("total"):
+            lines.append(f"📊 Заявок по фильтру: {_esc(last['total'])}")
+
+        lines.extend([
             f"📨 Отправлено уведомлений: {_esc(status['total_sent'])}",
             f"⚠️ Последняя ошибка: {_esc(status['last_error'])} ({_esc(status['last_error_time'])})",
-        ]
+        ])
 
         sla = status.get("sla") or {}
         if sla:
@@ -158,6 +165,11 @@ def register_sd_commands(
                 ]
             if result.errors:
                 lines.append(f"⚠️ Ошибки: {'; '.join(result.errors)}")
+            total = getattr(result, "total_count", 0)
+            if total:
+                lines.append(f"📊 Всего по фильтру: {total}")
+            if getattr(result, "filter_changed", False):
+                lines.append("🔄 Фильтр изменился — срез запомнен без рассылки")
             sla_warned = getattr(result, "sla_warned", 0)
             sla_expired = getattr(result, "sla_expired", 0)
             if sla_warned or sla_expired:

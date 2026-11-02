@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 import sys
 from dataclasses import replace
@@ -67,13 +68,13 @@ class FailingBot(FakeBot):
         await super().send_message(chat_id, text, **_kwargs)
 
 
-def make_request(number: int) -> SDRequest:
+def make_request(number: int, created: str = "01.11.2026 10:00") -> SDRequest:
     return SDRequest(
         sys_id=f"{number:032x}",
         number=f"REQ{4305000 + number}",
         short_description=f"Тестовая заявка {number}",
         assigned_user="Иванов И.И.",
-        sys_created_at="01.11.2026 10:00",
+        sys_created_at=created,
         state="Новая",
         multicard_comment_ing="",
     ).with_base_url("https://sd.example.ru")
@@ -83,6 +84,7 @@ def make_sla_request(
     number: int,
     deadline: datetime | None,
     *,
+    created: str = "01.11.2026 10:00",
     resolved: str | None = None,
 ) -> SDRequest:
     """Заявка с дедлайном СУТС для сценариев SLA."""
@@ -91,7 +93,7 @@ def make_sla_request(
         number=f"REQ{4305000 + number}",
         short_description=f"SUTSPROD-{17350000 + number}",
         assigned_user="Иванов И.И.",
-        sys_created_at="01.11.2026 10:00",
+        sys_created_at=created,
         state="В работе",
         multicard_comment_ing="",
         multicard_request_type="Поддержка касс",
@@ -105,12 +107,19 @@ def make_sla_request(
     ).with_base_url("https://sd.example.ru")
 
 
-def seen_store(data_dir: Path, req: SDRequest) -> SDStateStore:
-    """Состояние, в котором заявка уже известна, а SLA-контроль инициализирован."""
+def signature_for(cfg: Config) -> str:
+    """Та же подпись фильтра, что считает watcher."""
+    raw = f"{cfg.sd_view}\n{cfg.sd_condition}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def seen_store(data_dir: Path, req: SDRequest, cfg: Config) -> SDStateStore:
+    """Состояние, в котором заявка известна, а подпись фильтра уже стоит."""
     store = SDStateStore(data_dir)
     state = store.load()
     state.mark_seen(req.number, req.sys_id, req.code)
     state.sla_initialized = True
+    state.filter_signature = signature_for(cfg)
     store.save()
     return store
 
@@ -294,9 +303,10 @@ async def scenario_no_recipients(data_dir: Path) -> None:
 async def scenario_sla_warn_once(data_dir: Path) -> None:
     """В окне 2 ч приходит одно предупреждение с кнопкой и дедлайном."""
     req = make_sla_request(100, at(18))
-    store = seen_store(data_dir, req)
+    cfg = make_config(data_dir, seed=False)
+    store = seen_store(data_dir, req, cfg)
     bot = FakeBot()
-    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+    watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
 
     result = await watcher._check_once(now=at(16, 30))
 
@@ -325,9 +335,10 @@ async def scenario_sla_warn_once(data_dir: Path) -> None:
 async def scenario_sla_expired_once(data_dir: Path) -> None:
     """Просрочка приходит один раз и без запоздалого «осталось 2 ч»."""
     req = make_sla_request(101, at(18))
-    store = seen_store(data_dir, req)
+    cfg = make_config(data_dir, seed=False)
+    store = seen_store(data_dir, req, cfg)
     bot = FakeBot()
-    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+    watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
 
     result = await watcher._check_once(now=at(18, 30))
 
@@ -347,10 +358,11 @@ async def scenario_sla_expired_once(data_dir: Path) -> None:
 async def scenario_sla_deadline_changed(data_dir: Path) -> None:
     """Перенос дедлайна в SD запускает новый цикл уведомлений."""
     req = make_sla_request(102, at(18))
-    store = seen_store(data_dir, req)
+    cfg = make_config(data_dir, seed=False)
+    store = seen_store(data_dir, req, cfg)
     bot = FakeBot()
     client = FakeClient([req])
-    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, client)
+    watcher = SDWatcher(cfg, bot, store, client)
 
     await watcher._check_once(now=at(16, 30))
     assert store.state.sla_warn_sent == 1
@@ -366,16 +378,96 @@ async def scenario_sla_deadline_changed(data_dir: Path) -> None:
     print("  OK: после переноса дедлайна уведомления срабатывают заново")
 
 
-async def scenario_sla_silent_upgrade(data_dir: Path) -> None:
-    """Первое включение SLA на живом боте: одна сводка, без пачки «сгоревших»."""
-    req = make_sla_request(103, at(10))
+async def scenario_new_requests_sorted_by_date(data_dir: Path) -> None:
+    """Пачка новых сортируется по дате, а не по строке «02.11» < «31.10»."""
+    old = make_request(130, created="31.10.2026 23:59")
+    new = make_request(131, created="02.11.2026 00:01")
+    cfg = make_config(data_dir, seed=False)
+    bot = FakeBot()
+    watcher = SDWatcher(cfg, bot, SDStateStore(data_dir), FakeClient([new, old]))
+
+    result = await watcher._check_once(now=at(12))
+
+    assert result.total_count == 2
+    texts = [text for _, text in bot.sent]
+    assert len(texts) == 2, f"ожидали два уведомления, получили {len(texts)}"
+    assert "REQ4305130" in texts[0], f"первым должно быть 31.10:\n{texts[0]}"
+    assert "REQ4305131" in texts[1], f"вторым должно быть 02.11:\n{texts[1]}"
+    print("  OK: новые заявки идут в правильном хронологическом порядке")
+
+
+async def scenario_filter_migration(data_dir: Path) -> None:
+    """Смена фильтра: тихая переинициализация и дайджест, без залпа."""
+    old = make_request(120, created="30.10.2026 10:00")
+    new1 = make_request(121, created="31.10.2026 11:00")
+    new2 = make_request(122, created="02.11.2026 09:00")
+    cfg = make_config(data_dir, seed=False)
     store = SDStateStore(data_dir)
     state = store.load()
-    state.mark_seen(req.number, req.sys_id, req.code)  # sla_initialized = False
+    state.mark_seen(old.number, old.sys_id, old.code)
+    state.filter_signature = "old-signature"
+    state.sla_initialized = True
     store.save()
 
     bot = FakeBot()
-    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+    watcher = SDWatcher(cfg, bot, store, FakeClient([old, new1, new2]))
+    result = await watcher._check_once(now=at(12))
+
+    assert result.filter_changed is True, "смена фильтра не распознана"
+    assert result.seeded == 3
+    assert result.total_count == 3
+    assert len(bot.sent) == 1, f"ожидали одну сводку, получили {len(bot.sent)}"
+    text = bot.sent[0][1]
+    assert "Фильтр заявок обновлён" in text, text
+    assert "Новых для бота: 2" in text, text
+    assert "Пропущенные заявки" in text and "REQ4305121" in text and "REQ4305122" in text
+    assert "Новая заявка" not in text, "не должно быть отдельных уведомлений"
+    assert store.state.is_seen(new1.number, new1.sys_id), "новая заявка не помечена увиденной"
+    assert store.state.filter_signature == watcher._filter_signature()
+
+    before = len(bot.sent)
+    await watcher._check_once(now=at(12, 1))
+    assert len(bot.sent) == before, "после миграции сообщения не повторяются"
+    print("  OK: смена фильтра даёт одну сводку с дайджестом, без залпа")
+
+
+async def scenario_filter_upgrade_empty_signature(data_dir: Path) -> None:
+    """Обновление с версии без подписи: старый срез не рассылается заново."""
+    seen = make_request(123, created="30.10.2026 10:00")
+    fresh = make_request(124, created="02.11.2026 09:30")
+    cfg = make_config(data_dir, seed=False)
+    store = SDStateStore(data_dir)
+    state = store.load()
+    state.mark_seen(seen.number, seen.sys_id, seen.code)
+    # filter_signature пустой — как после обновления кода
+    state.sla_initialized = True
+    store.save()
+
+    bot = FakeBot()
+    watcher = SDWatcher(cfg, bot, store, FakeClient([seen, fresh]))
+    result = await watcher._check_once(now=at(12))
+
+    assert result.filter_changed is True
+    assert len(bot.sent) == 1 and "Фильтр заявок обновлён" in bot.sent[0][1]
+    assert "Новых для бота: 1" in bot.sent[0][1]
+    assert store.state.is_seen(fresh.number, fresh.sys_id)
+    assert store.state.filter_signature == watcher._filter_signature()
+    print("  OK: обновление без подписи не присылает старые заявки заново")
+
+
+async def scenario_sla_first_enable(data_dir: Path) -> None:
+    """Первое включение SLA на работающем боте: одна сводка, без пачки «сгоревших»."""
+    req = make_sla_request(103, at(10))
+    cfg = make_config(data_dir, seed=False)
+    store = SDStateStore(data_dir)
+    state = store.load()
+    state.mark_seen(req.number, req.sys_id, req.code)
+    state.filter_signature = signature_for(cfg)  # фильтр не менялся
+    state.sla_initialized = False  # SLA включается впервые
+    store.save()
+
+    bot = FakeBot()
+    watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
 
     result = await watcher._check_once(now=at(12))
 
@@ -405,6 +497,8 @@ async def scenario_sla_first_run(data_dir: Path) -> None:
     assert len(bot.sent) == 1, f"ожидали одно сообщение, получили {len(bot.sent)}"
     text = bot.sent[0][1]
     assert "SD-мониторинг запущен" in text and "SLA" in text, text
+    assert "Последние заявки по фильтру" in text, text
+    assert "Новая заявка" not in text, "история не должна литься отдельными сообщениями"
     assert "сгорела по SLA" not in text, "история не должна литься в чат"
 
     before = len(bot.sent)
@@ -438,15 +532,17 @@ async def scenario_sla_skips_unusable(data_dir: Path) -> None:
     resolved = make_sla_request(107, at(10), resolved="01.11.2026 10:30")
 
     store = SDStateStore(data_dir)
+    cfg = make_config(data_dir, seed=False)
     state = store.load()
     for req in (no_deadline, resolved):
         state.mark_seen(req.number, req.sys_id, req.code)
     state.sla_initialized = True
+    state.filter_signature = signature_for(cfg)
     store.save()
 
     bot = FakeBot()
     watcher = SDWatcher(
-        make_config(data_dir, seed=False),
+        cfg,
         bot,
         store,
         FakeClient([no_deadline, resolved]),
@@ -461,9 +557,10 @@ async def scenario_sla_skips_unusable(data_dir: Path) -> None:
 async def scenario_sla_retry_after_failure(data_dir: Path) -> None:
     """Недоставленный SLA-алерт не теряется и не дублируется после успеха."""
     req = make_sla_request(108, at(10))
-    store = seen_store(data_dir, req)
+    cfg = make_config(data_dir, seed=False)
+    store = seen_store(data_dir, req, cfg)
     bot = FailingBot()
-    watcher = SDWatcher(make_config(data_dir, seed=False), bot, store, FakeClient([req]))
+    watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
 
     await watcher._check_once(now=at(12))
     assert bot.attempts == 1, f"попыток отправки: {bot.attempts}"
@@ -486,12 +583,13 @@ async def scenario_sla_retry_after_failure(data_dir: Path) -> None:
 async def scenario_sla_disabled(data_dir: Path) -> None:
     """SD_SLA_ENABLED=false отключает авто-алерты, но не ломает проверку."""
     req = make_sla_request(109, at(10))
+    cfg = replace(make_config(data_dir, seed=False), sd_sla_enabled=False)
     store = SDStateStore(data_dir)
     state = store.load()
     state.mark_seen(req.number, req.sys_id, req.code)
+    state.filter_signature = signature_for(cfg)
     store.save()
     bot = FakeBot()
-    cfg = replace(make_config(data_dir, seed=False), sd_sla_enabled=False)
     watcher = SDWatcher(cfg, bot, store, FakeClient([req]))
 
     result = await watcher._check_once(now=at(12))
@@ -543,10 +641,13 @@ async def main() -> None:
     await scenario_no_recipients(base)
 
     for title, scenario in (
+        ("Фильтр: смена", scenario_filter_migration),
+        ("Фильтр: обновление без подписи", scenario_filter_upgrade_empty_signature),
+        ("Сортировка новых заявок", scenario_new_requests_sorted_by_date),
         ("SLA: предупреждение", scenario_sla_warn_once),
         ("SLA: просрочка", scenario_sla_expired_once),
         ("SLA: перенос дедлайна", scenario_sla_deadline_changed),
-        ("SLA: первое включение", scenario_sla_silent_upgrade),
+        ("SLA: первое включение", scenario_sla_first_enable),
         ("SLA: первый запуск", scenario_sla_first_run),
         ("SLA: новая заявка без дубля", scenario_sla_new_ticket_no_double),
         ("SLA: неподходящие заявки", scenario_sla_skips_unusable),

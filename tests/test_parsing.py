@@ -20,6 +20,7 @@ from sd_client import (  # noqa: E402
     SDClient,
     extract_subject_code,
     format_sd_datetime,
+    normalize_deadline,
     parse_sd_datetime,
     unwrap_value,
 )
@@ -121,6 +122,26 @@ def scenario_parse_item() -> None:
     print("  OK: запись разбирается в человеческие значения")
 
 
+def scenario_epoch_deadline() -> None:
+    """«01.01.1970» — это отсутствие дедлайна, а не просрочка."""
+    assert normalize_deadline("01.01.1970 00:00") == (None, None)
+    assert normalize_deadline("") == (None, None)
+    assert normalize_deadline("01.11.2026 10:40")[1] == datetime(2026, 11, 1, 10, 40)
+
+    client = make_client()
+    item = dict(RAW_ITEM)
+    item["multicard_deadline"] = {"value": "01.01.1970 00:00"}
+    request = client._parse_item(item)
+
+    assert request is not None
+    assert request.deadline_at is None, f"1970 попал в SLA: {request.deadline_at!r}"
+    assert request.multicard_deadline is None
+    text = request.with_base_url("https://sd.example.ru").format_notification()
+    assert "1970" not in text, f"в уведомлении остался 1970 год:\n{text}"
+    assert "Дедлайн СУТС" not in text, f"пустой дедлайн показан как срок:\n{text}"
+    print("  OK: дедлайн-заглушка 1970 считается отсутствующей")
+
+
 def scenario_notification() -> None:
     client = make_client()
     request = client._parse_item(RAW_ITEM).with_base_url("https://sd.servionica.ru")
@@ -166,6 +187,7 @@ def main() -> None:
         ("[разворачивание обёрток]", scenario_unwrap),
         ("[формат дат]", scenario_datetime),
         ("[дедлайн для SLA]", scenario_deadline_parse),
+        ("[дедлайн-заглушка 1970]", scenario_epoch_deadline),
         ("[разбор записи]", scenario_parse_item),
         ("[текст уведомления]", scenario_notification),
         ("[код в теме]", scenario_code_detection),

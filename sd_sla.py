@@ -216,3 +216,33 @@ def today_blocks(
             )
         )
     return blocks
+
+
+DIGEST_LIMIT = 20
+
+
+def digest_line(req: "SDRequest", tz_name: str) -> str:
+    """Одна строка дайджеста: ссылка, когда создана, дедлайн."""
+    return (
+        f'• <a href="{_esc(req.url)}">{_esc(request_title(req))}</a>'
+        f" · создана {_esc(req.sys_created_at or '—')}"
+        f" · дедлайн {_esc(_deadline_text(req, tz_name))}"
+    )
+
+
+def format_digest(
+    requests: list["SDRequest"],
+    label: str,
+    tz_name: str,
+    limit: int = DIGEST_LIMIT,
+) -> str:
+    """Короткий дайджест пропущенных/последних заявок одним текстом."""
+    if not requests:
+        return ""
+
+    lines = [f"🆕 <b>{_esc(label)}: {len(requests)}</b>"]
+    for req in requests[:limit]:
+        lines.append(digest_line(req, tz_name))
+    if len(requests) > limit:
+        lines.append(f"… и ещё {len(requests) - limit} — /sd_dump")
+    return "\n".join(lines)

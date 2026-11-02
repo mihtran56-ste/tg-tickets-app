@@ -49,6 +49,8 @@ class SDState:
     sla_events: dict[str, dict[str, Any]] = field(default_factory=dict)
     sla_warn_sent: int = 0
     sla_expired_sent: int = 0
+    # Подпись условия фильтра: по ней видно, что фильтр в SD поменяли.
+    filter_signature: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +65,7 @@ class SDState:
             "sla_events": self.sla_events,
             "sla_warn_sent": self.sla_warn_sent,
             "sla_expired_sent": self.sla_expired_sent,
+            "filter_signature": self.filter_signature,
         }
 
     @classmethod
@@ -118,6 +121,10 @@ class SDState:
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"поле {name} должно быть целым числом")
 
+        filter_signature = data.get("filter_signature", "")
+        if not isinstance(filter_signature, str):
+            raise TypeError("поле filter_signature должно быть строкой")
+
         return cls(
             last_check=float(data.get("last_check", 0.0)),
             seen_numbers=[str(item) for item in data.get("seen_numbers", [])],
@@ -130,6 +137,7 @@ class SDState:
             sla_events=sla_events,
             sla_warn_sent=int(data.get("sla_warn_sent", 0)),
             sla_expired_sent=int(data.get("sla_expired_sent", 0)),
+            filter_signature=filter_signature,
         )
 
     def is_seen(self, number: str, sys_id: str) -> bool:

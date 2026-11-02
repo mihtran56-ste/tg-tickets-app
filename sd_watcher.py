@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -14,11 +15,12 @@ from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import Config
-from sd_client import SDClient, SDRequest
+from sd_client import SDClient, SDRequest, parse_sd_datetime
 from sd_sla import (
     SLA_EXPIRED,
     SLA_WARN,
     deadline_key,
+    format_digest,
     format_sla_notification,
     localize,
     now_in,
@@ -42,6 +44,10 @@ class WatchResult:
     # Сколько SLA-сообщений ушло за эту проверку
     sla_warned: int = 0
     sla_expired: int = 0
+    # Сколько заявок вернул фильтр (для /sd_status)
+    total_count: int = 0
+    # Фильтр в SD поменяли — в этом тике была тихая переинициализация
+    filter_changed: bool = False
 
 
 class SDWatcher:
@@ -142,6 +148,8 @@ class SDWatcher:
         new_requests: list[SDRequest] = []
         sla_warned = 0
         sla_expired = 0
+        total_count = 0
+        filter_changed = False
 
         try:
             # Получаем заявки из SD (возвращает tuple: items, total)
@@ -154,14 +162,17 @@ class SDWatcher:
             # Важно: определяем первый запуск ДО фиксации времени проверки,
             # иначе условие last_check == 0 уже не выполнится.
             first_run = self._is_first_run()
+            state = self.state_store.state
+            signature = self._filter_signature()
+            # Пустая подпись при наличии истории — это обновление с версии,
+            # где подписи ещё не было: фильтр мог быть другим, поэтому мигрируем.
+            history = bool(state.seen_numbers or state.seen_sys_ids)
+            filter_changed = history and state.filter_signature != signature
 
             # Проверка состоялась — фиксируем время. Это же не даёт «тихому
             # первому запуску» сработать второй раз, если первая рассылка
             # не удалась: last_check уже не ноль.
             self.state_store.update_last_check()
-
-            # Фильтруем новые
-            state = self.state_store.state
 
             # Первый запуск (в т.ч. переезд на чистый диск): запоминаем текущие
             # заявки молча, чтобы не присылать историю заново.
@@ -174,19 +185,60 @@ class SDWatcher:
                     # запуск пришлёт пачку «сгоревших» за всю историю.
                     sla_counts = self._init_sla(requests, moment)
                     state.sla_initialized = True
+                state.filter_signature = signature
                 self.state_store.save()
                 log.info(
                     "Первый запуск: запомнено %d заявок без уведомлений (total=%d)",
                     len(requests),
                     total_count,
                 )
-                await self._send_startup_summary(len(requests), total_count, sla_counts)
+                digest = self._digest(requests, "Последние заявки по фильтру", limit=10)
+                await self._send_startup_summary(
+                    len(requests), total_count, sla_counts, digest
+                )
                 return WatchResult(
                     checked_at=time.time(),
                     new_requests=[],
                     errors=[],
                     duration_ms=int((time.time() - start) * 1000),
                     seeded=len(requests),
+                    total_count=total_count,
+                )
+
+            # Фильтр в SD поменяли (или обновили версию бота): тихо берём новый
+            # срез под наблюдение, иначе прилетит по сообщению на каждую «новую»
+            # заявку и пачка SLA-алертов.
+            if filter_changed:
+                unseen = [
+                    req
+                    for req in requests
+                    if not state.is_seen(req.number, req.sys_id)
+                ]
+                for req in requests:
+                    state.mark_seen(req.number, req.sys_id, req.code)
+                sla_counts = None
+                if self.cfg.sd_sla_enabled:
+                    sla_counts = self._init_sla(requests, moment)
+                    state.sla_initialized = True
+                state.filter_signature = signature
+                self.state_store.save()
+                log.warning(
+                    "Фильтр SD изменился: видно %d, новых для бота %d — запомнены без рассылки",
+                    len(requests),
+                    len(unseen),
+                )
+                digest = self._digest(unseen, "Пропущенные заявки")
+                await self._send_filter_summary(
+                    len(requests), total_count, len(unseen), digest, sla_counts
+                )
+                return WatchResult(
+                    checked_at=time.time(),
+                    new_requests=[],
+                    errors=[],
+                    duration_ms=int((time.time() - start) * 1000),
+                    seeded=len(requests),
+                    total_count=total_count,
+                    filter_changed=True,
                 )
 
             # Первое появление SLA-контроля на работающем боте (обновление версии):
@@ -201,12 +253,17 @@ class SDWatcher:
                 if had_history:
                     await self._send_sla_summary(*sla_counts)
 
+            if state.filter_signature != signature:
+                state.filter_signature = signature
+                self.state_store.save()
+
             for req in requests:
                 if not state.is_seen(req.number, req.sys_id):
                     new_requests.append(req)
 
-            # Сортируем по дате создания (старые сначала)
-            new_requests.sort(key=lambda r: r.sys_created_at)
+            # Сортируем по дате создания (старые сначала). Именно по разобранной
+            # дате: строки "02.11.2026" и "31.10.2026" сравниваются неверно.
+            new_requests.sort(key=self._created_key)
 
             log.info("Проверка SD: всего %d (total=%d), новых %d", len(requests), total_count, len(new_requests))
 
@@ -232,6 +289,8 @@ class SDWatcher:
             duration_ms=duration_ms,
             sla_warned=sla_warned,
             sla_expired=sla_expired,
+            total_count=total_count,
+            filter_changed=filter_changed,
         )
 
     def _is_first_run(self) -> bool:
@@ -250,11 +309,26 @@ class SDWatcher:
         value = f"{self.cfg.sd_sla_warn_hours:g}".replace(".", ",")
         return f"{value} ч"
 
+    def _filter_signature(self) -> str:
+        """Короткая подпись условия фильтра — по ней ловим его изменение."""
+        raw = f"{self.cfg.sd_view}\n{self.cfg.sd_condition}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def _created_key(self, req: SDRequest) -> datetime:
+        """Ключ сортировки по дате создания (а не по строке)."""
+        return parse_sd_datetime(req.sys_created_at) or datetime.min
+
+    def _digest(self, requests: list[SDRequest], label: str, limit: int = 20) -> str:
+        """Текст дайджеста: новые сверху, с ограничением на количество строк."""
+        ordered = sorted(requests, key=self._created_key, reverse=True)
+        return format_digest(ordered, label, self.cfg.sd_timezone, limit=limit)
+
     async def _send_startup_summary(
         self,
         seeded: int,
         total_count: int,
         sla_counts: tuple[int, int, int] | None = None,
+        digest: str = "",
     ) -> None:
         """Одно сообщение при первом запуске: мониторинг работает, история не льётся."""
         chat_ids = list(self.cfg.sd_notify_chat_ids or self.cfg.allowed_user_ids)
@@ -273,6 +347,8 @@ class SDWatcher:
                 f"\n⏰ SLA: под наблюдением {tracked}, уже просрочено {expired}, "
                 f"в окне {self._warn_label()}: {warning}"
             )
+        if digest:
+            text += "\n\n" + digest
 
         for chat_id in chat_ids:
             try:
@@ -319,6 +395,50 @@ class SDWatcher:
                 log.warning("Сеть Telegram для chat_id=%s: %s", chat_id, e)
             except Exception:
                 log.exception("Ошибка отправки сводки SLA в chat_id=%s", chat_id)
+
+    async def _send_filter_summary(
+        self,
+        visible: int,
+        total_count: int,
+        unseen: int,
+        digest: str,
+        sla_counts: tuple[int, int, int] | None,
+    ) -> None:
+        """Одна сводка при смене фильтра: без залпа уведомлений по старым заявкам."""
+        chat_ids = list(self.cfg.sd_notify_chat_ids or self.cfg.allowed_user_ids)
+        if not chat_ids:
+            return
+
+        text = (
+            "🔄 <b>Фильтр заявок обновлён</b>\n"
+            f"📊 Видно заявок: <b>{total_count or visible}</b>\n"
+            f"🆕 Новых для бота: {unseen} — запомнены без рассылки"
+        )
+        if sla_counts is not None:
+            tracked, expired, warning = sla_counts
+            text += (
+                f"\n⏰ SLA: под наблюдением {tracked}, уже просрочено {expired}, "
+                f"в окне {self._warn_label()}: {warning}"
+            )
+        if digest:
+            text += "\n\n" + digest
+
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                log.info("Сводка о смене фильтра отправлена в chat_id=%s", chat_id)
+            except TelegramUnauthorizedError:
+                log.error("Бот не авторизован в Telegram (неверный токен)")
+                break
+            except TelegramNetworkError as e:
+                log.warning("Сеть Telegram для chat_id=%s: %s", chat_id, e)
+            except Exception:
+                log.exception("Ошибка отправки сводки о фильтре в chat_id=%s", chat_id)
 
     async def _send_notifications(self, requests: list[SDRequest], total_count: int = 0) -> None:
         """Отправляет уведомления о новых заявках."""
@@ -540,6 +660,8 @@ class SDWatcher:
                 "duration_ms": self._last_result.duration_ms if self._last_result else 0,
                 "sla_warned": self._last_result.sla_warned if self._last_result else 0,
                 "sla_expired": self._last_result.sla_expired if self._last_result else 0,
+                "total": self._last_result.total_count if self._last_result else 0,
+                "filter_changed": self._last_result.filter_changed if self._last_result else False,
             } if self._last_result else None,
         }
 

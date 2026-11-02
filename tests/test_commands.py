@@ -85,6 +85,10 @@ class FakeWatcher:
             duration_ms = 42
             new_requests: list = []
             errors: list = []
+            total_count = 34
+            filter_changed = False
+            sla_warned = 0
+            sla_expired = 0
 
         return Result()
 
@@ -193,6 +197,7 @@ async def scenario_test_command() -> None:
     assert watcher.check_calls == 1, "проверка не запустилась"
     assert any("Проверяю SD" in a for a in message.answers), f"нет промежуточного сообщения: {message.answers}"
     assert "Новых заявок нет" in message.last, f"нет итога проверки: {message.last}"
+    assert "Всего по фильтру: 34" in message.last, f"нет размера выборки: {message.last}"
     print("  OK: /sd_test запускает проверку и сообщает результат")
 
 
@@ -407,7 +412,17 @@ async def scenario_status_sla() -> None:
         "total_sent": 25,
         "last_error": "нет",
         "last_error_time": "—",
-        "last_result": None,
+        "last_result": {
+            "checked_at": "01.11.2026 12:00:00",
+            "new_count": 0,
+            "seeded": 0,
+            "errors": [],
+            "duration_ms": 42,
+            "sla_warned": 0,
+            "sla_expired": 0,
+            "total": 34,
+            "filter_changed": False,
+        },
         "sla": {
             "enabled": True,
             "warn_hours": 2.0,
@@ -427,7 +442,8 @@ async def scenario_status_sla() -> None:
     assert "SLA: ✅ вкл" in text, f"нет статуса SLA:\n{text}"
     assert "порог 2 ч" in text
     assert "Предупреждений: 3" in text and "сгорело: 2" in text
-    print("  OK: /sd_status показывает порог и счётчики SLA")
+    assert "Заявок по фильтру: 34" in text, f"нет размера выборки:\n{text}"
+    print("  OK: /sd_status показывает порог, счётчики SLA и размер фильтра")
 
 
 async def main() -> None:

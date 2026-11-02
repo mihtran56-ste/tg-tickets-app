@@ -150,6 +150,25 @@ def parse_sd_datetime(value: str) -> datetime | None:
     return None
 
 
+MIN_REAL_DEADLINE_YEAR = 2000
+
+
+def normalize_deadline(value: str) -> tuple[str | None, datetime | None]:
+    """Возвращает дедлайн для показа и для расчёта SLA.
+
+    SimpleOne отдаёт «01.01.1970 00:00», когда дедлайна нет. Это не срок:
+    иначе SLA пришлёт ложную просрочку, а в уведомлении появится 1970 год.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None, None
+
+    parsed = parse_sd_datetime(text)
+    if parsed is None or parsed.year < MIN_REAL_DEADLINE_YEAR:
+        return None, None
+    return format_sd_datetime(text) or None, parsed
+
+
 def redact_secrets(text: str) -> str:
     """Прячет токены и пароли перед записью в лог.
 
@@ -767,6 +786,10 @@ class SDClient:
         if not number or not sys_id:
             return None
 
+        deadline_display, deadline_at = normalize_deadline(
+            unwrap_value(item.get("multicard_deadline"))
+        )
+
         return SDRequest(
             sys_id=sys_id,
             number=number,
@@ -779,13 +802,13 @@ class SDClient:
             multicard_name_client=get_val("multicard_name_client") or None,
             multicard_pos=get_val("multicard_pos") or None,
             multicard_terminal_address=get_val("multicard_terminal_address") or None,
-            multicard_deadline=get_date("multicard_deadline") or None,
+            multicard_deadline=deadline_display,
             resolved_at=get_date("resolved_at") or None,
             planning_state=get_val("planning_state") or None,
             ab_spot_address=get_val("ab_spot_address") or None,
             hold_code=get_val("hold_code") or None,
             table=get_val("__table_name") or "itsm_request",
-            deadline_at=parse_sd_datetime(unwrap_value(item.get("multicard_deadline"))),
+            deadline_at=deadline_at,
         )
 
 
