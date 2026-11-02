@@ -233,17 +233,25 @@ class SDRequest:
         return self.code or self.number
 
     def format_short(self, index: int = 0) -> str:
-        """Компактная строка для списков (/sd_dump): код, статус, исполнитель, дата."""
+        """Компактная строка для списков (/sd_dump).
+
+        Формат: код | статус | тип | исполнитель | создана | дедлайн СУТС.
+        Поля, которых нет, пропускаются, чтобы не было «пустых» разделителей.
+        """
         name = html.escape(self.display_name)
         link = html.escape(self.url)
         prefix = f"{index}. " if index else ""
         parts = [f'{prefix}<a href="{link}">{name}</a>']
         if self.state:
             parts.append(html.escape(self.state))
+        if self.multicard_request_type:
+            parts.append(html.escape(self.multicard_request_type))
         if self.assigned_user:
             parts.append(html.escape(self.assigned_user))
         if self.sys_created_at:
             parts.append(html.escape(self.sys_created_at))
+        if self.multicard_deadline:
+            parts.append(f"⏰ {html.escape(self.multicard_deadline)}")
         return " | ".join(parts)
 
     def __post_init__(self):
