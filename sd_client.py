@@ -361,7 +361,11 @@ class SDClient:
 
     async def _ensure_session(self) -> None:
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            # total=60 — весь запрос; sock_read=45 — чтение одного блока тела.
+            # Страница 2 в ServiceDesk иногда «досчитывается» на сервере дольше
+            # 30 секунд: при total=30 resp.text() падал по таймауту, и в
+            # уведомлении об автопаузе появлялось "TimeoutError: " без причины.
+            timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
             # Проверка сертификата обязательна: через это соединение уходят
             # логин и пароль. Отключать можно только при явной необходимости
             # (SD_VERIFY_SSL=false), например при самоподписанном сертификате.
@@ -744,6 +748,18 @@ class SDClient:
                     items = self._parse_response(data, endpoint)
                     return items, extract_total(data)
 
+            except asyncio.TimeoutError:
+                # Таймаут может случиться не только в login(), но и здесь:
+                # SD отдал заголовки, а тело читается дольше ClientTimeout.
+                # Без этой ветки наружу уходил голый TimeoutError с пустым
+                # str(), и в автопаузе было "Причина: TimeoutError: ".
+                last_error = "таймаут при чтении ответа SD"
+                log.warning(
+                    "Таймаут при запросе %s (страница %d) — пропускаю страницу",
+                    endpoint,
+                    page_number,
+                )
+                return None
             except aiohttp.ClientError as e:
                 last_error = str(e)
                 log.debug("Ошибка запроса к %s: %s", endpoint, e)
