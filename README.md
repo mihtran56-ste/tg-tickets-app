@@ -41,6 +41,7 @@ Telegram-бот (aiogram 3) для работы с заявками и мони�
 | `bot.py` | точка входа: Dispatcher, команды, опрос Telegram |
 | `config.py` | чтение `.env` в `Config` |
 | `sd_client.py` | клиент SimpleOne: логин, получение заявок, форматирование |
+| `sd_proxy.py` | локальный reverse-proxy SD: снимает битый CSP-заголовок |
 | `sd_sla.py` | SLA: границы 2 ч/дедлайн, тексты сообщений, отчёт «сегодня» |
 | `sd_watcher.py` | фоновый цикл проверок и рассылки |
 | `sd_state.py` | состояние (`data/sd_state.json`): что уже отправлено, флаги SLA |

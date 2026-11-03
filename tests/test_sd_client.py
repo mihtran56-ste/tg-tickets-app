@@ -211,6 +211,17 @@ def scenario_no_false_positives() -> None:
     print("  OK: обычные сообщения не меняются")
 
 
+def scenario_proxy_base() -> None:
+    """С прокси HTTP-запросы идут на localhost, а ссылки остаются на SD."""
+    proxied = SDClient(make_client_cfg(sd_proxy_port=8765))
+    assert proxied.base_url == "https://sd.example.ru"
+    assert proxied._http_base == "http://127.0.0.1:8765", proxied._http_base
+
+    direct = SDClient(make_client_cfg())
+    assert direct._http_base == "https://sd.example.ru", direct._http_base
+    print("  OK: SDClient ходит через прокси, ссылки остаются на настоящий SD")
+
+
 async def scenario_ssl_verification() -> None:
     """Сертификат ServiceDesk проверяется: через соединение идут логин и пароль."""
 
@@ -250,6 +261,7 @@ async def main() -> None:
         ("[пароль в форме]", scenario_form_password),
         ("[пароль в JSON]", scenario_json_password),
         ("[ложные срабатывания]", scenario_no_false_positives),
+        ("[прокси-база]", scenario_proxy_base),
     ):
         print(f"\n{title}")
         scenario()

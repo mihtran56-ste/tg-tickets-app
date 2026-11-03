@@ -146,6 +146,7 @@ def scenario_ok(tmp: Path) -> None:
         SD_AUTH_METHOD=None,
         SD_MAX_FAILURES=None,
         SD_PAUSE_NOTIFY=None,
+        SD_PROXY_PORT=None,
     )
     config_module.BASE_DIR = tmp
     try:
@@ -160,6 +161,7 @@ def scenario_ok(tmp: Path) -> None:
         assert cfg.llm_api_key == "", "LLM по умолчанию выключен"
         assert cfg.sd_auth_method == "simpleone", f"метод входа по умолчанию: {cfg.sd_auth_method}"
         assert cfg.sd_max_failures == 2, f"порог неудач по умолчанию: {cfg.sd_max_failures}"
+        assert cfg.sd_proxy_port == 0, f"SD-прокси по умолчанию выключен: {cfg.sd_proxy_port}"
         assert cfg.sd_pause_notify is True, "уведомление об автопаузе должно быть включено"
         assert cfg.sd_sla_enabled is True, "SLA-контроль должен быть включён по умолчанию"
         assert cfg.sd_sla_warn_hours == 2.0, f"порог SLA: {cfg.sd_sla_warn_hours}"
@@ -181,11 +183,13 @@ def scenario_auth_settings(tmp: Path) -> None:
         SD_AUTH_METHOD="auto",
         SD_MAX_FAILURES="0",
         SD_PAUSE_NOTIFY="false",
+        SD_PROXY_PORT="8765",
     )
     try:
         cfg = config_module.load_config()
         assert cfg.sd_auth_method == "auto", f"метод: {cfg.sd_auth_method}"
         assert cfg.sd_max_failures == 1, f"минимум порога не применён: {cfg.sd_max_failures}"
+        assert cfg.sd_proxy_port == 8765, f"порт SD-прокси: {cfg.sd_proxy_port}"
         assert cfg.sd_pause_notify is False, "SD_PAUSE_NOTIFY=false не разобран"
         print("  OK: SD_AUTH_METHOD, минимум SD_MAX_FAILURES и флаг уведомления работают")
     finally:
@@ -199,6 +203,7 @@ def scenario_auth_settings(tmp: Path) -> None:
         SD_AUTH_METHOD="login_v2",
         SD_MAX_FAILURES=None,
         SD_PAUSE_NOTIFY=None,
+        SD_PROXY_PORT=None,
     )
     config_module.BASE_DIR = tmp
     try:

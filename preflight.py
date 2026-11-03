@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,16 +121,45 @@ def config_checks(cfg: Config) -> list[Check]:
     return checks
 
 
+def _free_port() -> int:
+    """Свободный локальный порт для временного SD-прокси."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 async def sd_check(cfg: Config, fetch=None) -> Check:
     """Живая проверка: вход в SD и получение списка заявок."""
     if not cfg.sd_enabled:
         return Check("ServiceDesk", True, "пропущено: SD_ENABLED=false", critical=False)
 
+    proxy_runner = None
+    client_cfg = cfg
     if fetch is None:
+        if cfg.sd_proxy_port:
+            from sd_proxy import start_sd_proxy
+
+            # Отдельный временный порт: preflight может работать, пока бот
+            # уже держит свой прокси на основном порту.
+            proxy_port = _free_port()
+            try:
+                proxy_runner = await start_sd_proxy(
+                    cfg.sd_base_url,
+                    proxy_port,
+                    verify_ssl=cfg.sd_verify_ssl,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return Check(
+                    "ServiceDesk",
+                    False,
+                    f"не удалось запустить SD proxy: {type(exc).__name__}: {exc}",
+                )
+            client_cfg = replace(cfg, sd_proxy_port=proxy_port)
+
         from sd_client import SDClient
 
         async def fetch() -> tuple[int, int]:
-            client = SDClient(cfg)
+            client = SDClient(client_cfg)
             try:
                 items, total = await client.fetch_requests(
                     view=cfg.sd_view, condition=cfg.sd_condition, limit=20
@@ -142,6 +172,9 @@ async def sd_check(cfg: Config, fetch=None) -> Check:
         count, total = await fetch()
     except Exception as exc:  # noqa: BLE001 — показываем причину, а не падаем
         return Check("ServiceDesk", False, f"ошибка: {type(exc).__name__}: {exc}")
+    finally:
+        if proxy_runner is not None:
+            await proxy_runner.cleanup()
 
     detail = f"заявок получено {count} из {total}"
     if total == 0:

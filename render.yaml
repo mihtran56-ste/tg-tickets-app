@@ -23,6 +23,8 @@ services:
         value: Default
       - key: SD_CHECK_INTERVAL
         value: "60"
+      - key: SD_PROXY_PORT
+        value: "8765"
       - key: SD_SEED_ON_FIRST_RUN
         value: "true"
       - key: SD_SLA_ENABLED

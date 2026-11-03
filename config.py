@@ -38,6 +38,7 @@ class Config:
     sd_login: str = ""
     sd_password: str = ""
     sd_check_interval: int = 60
+    sd_proxy_port: int = 0
     sd_notify_chat_ids: frozenset[int] = frozenset()
     sd_view: str = "Default"
     sd_condition: str = ""
@@ -202,6 +203,7 @@ def load_config() -> Config:
         sd_login=_env("SD_LOGIN"),
         sd_password=_env("SD_PASSWORD"),
         sd_check_interval=_int_env("SD_CHECK_INTERVAL", 60, 10),
+        sd_proxy_port=_int_env("SD_PROXY_PORT", 0, 0),
         sd_notify_chat_ids=_parse_ids(_env("SD_NOTIFY_CHAT_IDS")),
         sd_view=_env("SD_VIEW", "Default"),
         sd_condition=_env("SD_CONDITION"),

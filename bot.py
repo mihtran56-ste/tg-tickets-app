@@ -29,6 +29,7 @@ from tools import TOOLS, Toolbox
 
 # ServiceDesk интеграция
 from sd_client import SDClient
+from sd_proxy import start_sd_proxy
 from sd_settings import describe_missing
 from sd_state import SDStateStore
 from sd_watcher import SDWatcher
@@ -331,8 +332,18 @@ async def run(cfg: Config) -> None:
         )
 
     runtime_task: asyncio.Task | None = None
+    sd_proxy_runner = None
 
     try:
+        # Локальный прокси снимает битый CSP-заголовок SD, на котором падает
+        # строгий парсер aiohttp. Слушает только 127.0.0.1.
+        if sd_watcher is not None and cfg.sd_proxy_port:
+            sd_proxy_runner = await start_sd_proxy(
+                cfg.sd_base_url,
+                cfg.sd_proxy_port,
+                verify_ssl=cfg.sd_verify_ssl,
+            )
+
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Бот запущен.")
 
@@ -414,6 +425,8 @@ async def run(cfg: Config) -> None:
         if sd_watcher:
             await sd_watcher.stop()
             await sd_client.close()
+        if sd_proxy_runner:
+            await sd_proxy_runner.cleanup()
         await bot.session.close()
         log.info("Бот остановлен.")
 

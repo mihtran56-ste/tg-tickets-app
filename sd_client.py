@@ -363,6 +363,11 @@ class SDClient:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.base_url = cfg.sd_base_url.rstrip("/")
+        # HTTP-запросы идут через локальный reverse-proxy, если он включён;
+        # base_url остаётся настоящим — из него строятся ссылки на заявки.
+        self._http_base = self.base_url
+        if cfg.sd_proxy_port:
+            self._http_base = f"http://127.0.0.1:{cfg.sd_proxy_port}"
         self._login = cfg.sd_login
         self._password = cfg.sd_password
         self._verify_ssl = cfg.sd_verify_ssl
@@ -478,7 +483,7 @@ class SDClient:
     async def _login_via_api_json(self) -> tuple[bool, str]:
         """JSON API авторизация: /api/now/auth/login (ServiceNow style)."""
         assert self.session is not None
-        auth_url = urljoin(self.base_url, "/api/now/auth/login")
+        auth_url = urljoin(self._http_base, "/api/now/auth/login")
         async with self.session.post(auth_url, json={"username": self._login, "password": self._password}) as resp:
             log.info("POST %s -> HTTP %s", auth_url, resp.status)
             if resp.status == 401:
@@ -495,7 +500,7 @@ class SDClient:
     async def _login_via_simpleone_api(self) -> tuple[bool, str]:
         """SimpleOne API авторизация: /v1/auth/login."""
         assert self.session is not None
-        auth_url = urljoin(self.base_url, "/v1/auth/login")
+        auth_url = urljoin(self._http_base, "/v1/auth/login")
         payload = {"username": self._login, "password": self._password}
 
         async with self.session.post(auth_url, json=payload) as resp:
@@ -520,7 +525,7 @@ class SDClient:
     async def _login_via_auth_do(self) -> tuple[bool, str]:
         """Альтернативный эндпоинт: /auth.do."""
         assert self.session is not None
-        auth_url = urljoin(self.base_url, "/auth.do")
+        auth_url = urljoin(self._http_base, "/auth.do")
         payload = {
             "user_name": self._login,
             "user_password": self._password,
@@ -544,7 +549,7 @@ class SDClient:
         assert self.session is not None
 
         # 1. Получаем страницу логина
-        login_page_url = urljoin(self.base_url, "/login.do")
+        login_page_url = urljoin(self._http_base, "/login.do")
         async with self.session.get(login_page_url) as resp:
             log.info("GET %s -> HTTP %s", login_page_url, resp.status)
             if resp.status == 401:
@@ -577,7 +582,7 @@ class SDClient:
             return False, "форма логина не найдена"
 
         # 2. POST логин на правильный URL
-        login_url = urljoin(self.base_url, form_action)
+        login_url = urljoin(self._http_base, form_action)
         payload = {
             "user_name": self._login,
             "user_password": self._password,
@@ -614,7 +619,7 @@ class SDClient:
     async def _login_via_get_params(self) -> tuple[bool, str]:
         """GET с параметрами: /login.do?user_name=...&user_password=..."""
         assert self.session is not None
-        auth_url = urljoin(self.base_url, "/login.do")
+        auth_url = urljoin(self._http_base, "/login.do")
         params = {
             "user_name": self._login,
             "user_password": self._password,
@@ -726,7 +731,7 @@ class SDClient:
             Для ServiceNow-подобных эндпоинтов параллельно передаём offset.
             """
             nonlocal last_error
-            url = urljoin(self.base_url, endpoint)
+            url = urljoin(self._http_base, endpoint)
             params = dict(default_params)
             if view:
                 params["sysparm_view"] = view
