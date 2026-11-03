@@ -315,6 +315,33 @@ async def scenario_clear_error_not_called_on_errors() -> None:
     print("  OK: при ошибках ошибка записывается, а не стирается")
 
 
+async def scenario_partial_warning_keeps_counter() -> None:
+    """Partial-предупреждение не сбрасывает счётчик и не ставит паузу."""
+    bot = FakeBot()
+    store = FakeStateStore()
+    watcher = make_watcher(bot, FakeClient(), store)
+    watcher._consecutive_failures = 1
+
+    async def partial_check() -> WatchResult:
+        return WatchResult(
+            checked_at=time.time(),
+            new_requests=[],
+            errors=[],
+            duration_ms=1,
+            warnings=["страница 2 не загружена: таймаут"],
+        )
+
+    watcher._check_once = partial_check  # type: ignore[method-assign]
+    await run_loop_briefly(watcher, stop_after=2)
+
+    assert watcher._consecutive_failures == 1, "partial сбросил счётчик неудач"
+    assert watcher._paused_by_failures is False, "partial поставил автопаузу"
+    assert store.clears == 0, "partial вызвал clear_error()"
+    assert any("страница 2" in error for error in store.errors), store.errors
+    assert not bot.sent, f"partial отправил сообщение: {bot.texts}"
+    print("  OK: partial-предупреждение не сбрасывает счётчик и не ставит паузу")
+
+
 async def scenario_two_auth_failures_two_logins() -> None:
     """Неверный пароль: до автопаузы ровно 2 POST /v1/auth/login."""
     bot = FakeBot()
@@ -423,6 +450,7 @@ async def main() -> None:
         ("[цикл на паузе]", scenario_loop_paused_skips_sd),
         ("[check_now на паузе]", scenario_check_now_on_pause),
         ("[ошибки не стираются]", scenario_clear_error_not_called_on_errors),
+        ("[partial не сбрасывает счётчик]", scenario_partial_warning_keeps_counter),
         ("[2 логина: пароль]", scenario_two_auth_failures_two_logins),
         ("[2 логина: сеть]", scenario_two_network_failures_two_logins),
         ("[текст: пароль]", scenario_notification_text_auth),

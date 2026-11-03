@@ -7,7 +7,7 @@ import hashlib
 import html
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -49,6 +49,9 @@ class WatchResult:
     total_count: int = 0
     # Фильтр в SD поменяли — в этом тике была тихая переинициализация
     filter_changed: bool = False
+    # Мягкие предупреждения: например, не открылась страница 2.
+    # Они не считаются неудачей и не сбрасывают счётчик неудач.
+    warnings: list[str] = field(default_factory=list)
 
 
 class SDWatcher:
@@ -138,6 +141,14 @@ class SDWatcher:
                 if result.errors:
                     self.state_store.record_error("; ".join(result.errors))
                     await self._on_failure(result.errors)
+                elif result.warnings:
+                    # Частичная загрузка (например, страница 2 не открылась):
+                    # фиксируем предупреждение, но не сбрасываем счётчик
+                    # неудач и не ставим паузу.
+                    self.state_store.record_error("; ".join(result.warnings))
+                    log.warning(
+                        "Проверка SD частичная: %s", "; ".join(result.warnings)
+                    )
                 else:
                     self.state_store.clear_error()
                     self._on_success()
@@ -223,6 +234,7 @@ class SDWatcher:
         start = time.time()
         moment = now or now_in(self.cfg.sd_timezone)
         errors: list[str] = []
+        warnings: list[str] = []
         new_requests: list[SDRequest] = []
         sla_warned = 0
         sla_expired = 0
@@ -236,6 +248,7 @@ class SDWatcher:
                 condition=self.cfg.sd_condition,
                 limit=100,  # достаём больше, чем нужно, на случай пагинации
             )
+            warnings.extend(getattr(self.client, "last_fetch_warnings", []))
 
             # Важно: определяем первый запуск ДО фиксации времени проверки,
             # иначе условие last_check == 0 уже не выполнится.
@@ -281,6 +294,7 @@ class SDWatcher:
                     duration_ms=int((time.time() - start) * 1000),
                     seeded=len(requests),
                     total_count=total_count,
+                    warnings=warnings,
                 )
 
             # Фильтр в SD поменяли (или обновили версию бота): тихо берём новый
@@ -317,6 +331,7 @@ class SDWatcher:
                     seeded=len(requests),
                     total_count=total_count,
                     filter_changed=True,
+                    warnings=warnings,
                 )
 
             # Первое появление SLA-контроля на работающем боте (обновление версии):
@@ -369,6 +384,7 @@ class SDWatcher:
             sla_expired=sla_expired,
             total_count=total_count,
             filter_changed=filter_changed,
+            warnings=warnings,
         )
 
     def _is_first_run(self) -> bool:
@@ -742,6 +758,7 @@ class SDWatcher:
                 "sla_expired": self._last_result.sla_expired if self._last_result else 0,
                 "total": self._last_result.total_count if self._last_result else 0,
                 "filter_changed": self._last_result.filter_changed if self._last_result else False,
+                "warnings": self._last_result.warnings if self._last_result else [],
             } if self._last_result else None,
         }
 

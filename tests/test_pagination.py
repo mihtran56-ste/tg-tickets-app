@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
+import sd_client as sd_client_module  # noqa: E402
 from sd_client import SDClient  # noqa: E402
 
 
@@ -67,6 +68,23 @@ class FakeSession:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class TimeoutSession(FakeSession):
+    """Страницы из timeout_pages отвечают таймаутом."""
+
+    def __init__(self, pages: dict[int, dict], timeout_pages: set[int]) -> None:
+        super().__init__(pages)
+        self.timeout_pages = timeout_pages
+
+    def get(self, url: str, params: dict | None = None, headers: dict | None = None):
+        params = params or {}
+        self.requests.append(dict(params))
+        page = int(params.get("page", 1))
+        if page in self.timeout_pages:
+            raise asyncio.TimeoutError
+        payload = self.pages.get(page, page_payload([], 0))
+        return FakeResponse(payload)
 
 
 def make_client() -> SDClient:
@@ -157,6 +175,55 @@ async def scenario_empty() -> None:
     print("  OK: пустой результат не ломает цикл")
 
 
+async def scenario_working_endpoint_timeout() -> None:
+    """Таймаут рабочего эндпоинта: один повтор и понятная ошибка, без fallback."""
+    client = make_client()
+    client._working_endpoint = "/v1/list/itsm_request"
+    session = TimeoutSession({}, timeout_pages={1})
+    client.session = session
+
+    original_delay = sd_client_module.TRANSIENT_RETRY_DELAY
+    sd_client_module.TRANSIENT_RETRY_DELAY = 0
+    try:
+        try:
+            await client.fetch_requests(view="Default", condition="x", limit=100)
+        except RuntimeError as exc:
+            assert "таймаут" in str(exc).lower(), f"не та ошибка: {exc}"
+        else:
+            raise AssertionError("ожидали RuntimeError при таймауте рабочего эндпоинта")
+    finally:
+        sd_client_module.TRANSIENT_RETRY_DELAY = original_delay
+
+    pages = [r.get("page") for r in session.requests]
+    assert pages == [1, 1], f"должны быть 1 запрос + 1 повтор, а не {pages}"
+    print("  OK: таймаут рабочего эндпоинта не уводит в перебор чужих API")
+
+
+async def scenario_page_two_timeout_is_partial() -> None:
+    """Таймаут страницы 2: первая страница остаётся, но есть предупреждение."""
+    first = [f"REQ{i:04d}" for i in range(1, 21)]
+    client = make_client()
+    client._working_endpoint = "/v1/list/itsm_request"
+    session = TimeoutSession({1: page_payload(first, 28)}, timeout_pages={2})
+    client.session = session
+
+    original_delay = sd_client_module.TRANSIENT_RETRY_DELAY
+    sd_client_module.TRANSIENT_RETRY_DELAY = 0
+    try:
+        items, total = await client.fetch_requests(
+            view="Default", condition="x", limit=100
+        )
+    finally:
+        sd_client_module.TRANSIENT_RETRY_DELAY = original_delay
+
+    assert len(items) == 20 and total == 28, f"items={len(items)} total={total}"
+    assert client.last_fetch_warnings, "нет предупреждения о странице 2"
+    assert "страница 2" in client.last_fetch_warnings[0], client.last_fetch_warnings
+    pages = [r.get("page") for r in session.requests]
+    assert pages == [1, 2, 2], f"страница 2 должна быть с одним повтором: {pages}"
+    print("  OK: таймаут страницы 2 даёт partial-предупреждение, а не тихий успех")
+
+
 async def main() -> None:
     print("Проверка постраничной загрузки")
     for title, scenario in (
@@ -164,6 +231,8 @@ async def main() -> None:
         ("[сервер игнорирует page]", scenario_server_ignores_page),
         ("[одна страница]", scenario_single_page),
         ("[пусто]", scenario_empty),
+        ("[таймаут рабочего эндпоинта]", scenario_working_endpoint_timeout),
+        ("[таймаут страницы 2]", scenario_page_two_timeout_is_partial),
     ):
         print(f"\n{title}")
         await scenario()

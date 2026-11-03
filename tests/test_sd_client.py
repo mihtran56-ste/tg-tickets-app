@@ -152,9 +152,10 @@ async def scenario_one_relogin_per_fetch() -> None:
     try:
         await client.fetch_requests(view="Default", condition="state=1", limit=10)
     except RuntimeError as exc:
-        assert "Все эндпоинты" in str(exc), f"не та ошибка: {exc}"
+        text = str(exc)
+        assert "401" in text or "Сессия" in text, f"не та ошибка: {text}"
     else:
-        raise AssertionError("ожидали RuntimeError: все эндпоинты вернули 401")
+        raise AssertionError("ожидали RuntimeError после 401")
 
     posts = [call for call in session.calls if call[0] == "POST"]
     assert len(posts) == 2, (

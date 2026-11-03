@@ -141,6 +141,8 @@ def register_sd_commands(
             lines.append(f"  Длительность: {_esc(lr['duration_ms'])} мс")
             if lr["errors"]:
                 lines.append(f"  Ошибки: {_esc(', '.join(lr['errors']))}")
+            if lr.get("warnings"):
+                lines.append(f"  Предупреждения: {_esc(', '.join(lr['warnings']))}")
 
         await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -177,6 +179,9 @@ def register_sd_commands(
                 ]
             if result.errors:
                 lines.append(f"⚠️ Ошибки: {'; '.join(result.errors)}")
+            warnings = getattr(result, "warnings", [])
+            if warnings:
+                lines.append(f"⚠️ Предупреждения: {'; '.join(warnings)}")
             total = getattr(result, "total_count", 0)
             if total:
                 lines.append(f"📊 Всего по фильтру: {total}")

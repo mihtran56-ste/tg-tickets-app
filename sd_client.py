@@ -166,6 +166,10 @@ def parse_sd_datetime(value: str) -> datetime | None:
 
 MIN_REAL_DEADLINE_YEAR = 2000
 
+# Пауза перед повтором GET при таймауте. Логин не повторяем, чтобы не
+# создавать серию неудачных входов в SD.
+TRANSIENT_RETRY_DELAY = 2.0
+
 
 def normalize_deadline(
     value: str, tz_name: str | None = None
@@ -378,6 +382,9 @@ class SDClient:
         # Один релогин на вызов fetch_requests: не устраиваем серию неудачных
         # логинов при истёкшей сессии (это видно службе безопасности SD).
         self._relogin_attempted = False
+        # Мягкие предупреждения последней загрузки (например, не открылась
+        # страница 2). Их читает sd_watcher и не сбрасывает счётчик неудач.
+        self.last_fetch_warnings: list[str] = []
         # Рабочий эндпоинт, найденный ранее — чтобы не перебирать все заново
         self._working_endpoint: str | None = None
         # Поддерживает ли сервер постраничную выдачу (проверяем один раз)
@@ -652,6 +659,7 @@ class SDClient:
         """
         # Новый вызов — новая попытка релогина: не больше одной на проверку.
         self._relogin_attempted = False
+        self.last_fetch_warnings = []
 
         ok, reason = await self.login()
         if not ok:
@@ -717,6 +725,8 @@ class SDClient:
             endpoints.sort(key=lambda item: item[0] != self._working_endpoint)
 
         last_error: str | None = None
+        last_error_kind = "unknown"
+        last_transient_error: str | None = None
 
         async def _fetch_page(
             endpoint: str,
@@ -730,7 +740,8 @@ class SDClient:
             offset/limit: проверено на живом API — page=2 отдаёт остаток списка.
             Для ServiceNow-подобных эндпоинтов параллельно передаём offset.
             """
-            nonlocal last_error
+            nonlocal last_error, last_error_kind
+            last_error_kind = "unknown"
             url = urljoin(self._http_base, endpoint)
             params = dict(default_params)
             if view:
@@ -763,19 +774,31 @@ class SDClient:
                             raise RuntimeError(
                                 f"Сессия истекла, релогин не удался: {reason}")
                         last_error = f"HTTP {resp.status}"
+                        last_error_kind = "auth"
                         return None
 
                     if resp.status != 200:
                         last_error = f"HTTP {resp.status}"
+                        if resp.status == 504:
+                            # Прокси отдаёт 504, когда SD не ответил за свой таймаут.
+                            last_error = "таймаут при чтении ответа SD"
+                            last_error_kind = "transient"
+                        elif resp.status >= 500 or resp.status == 429:
+                            last_error_kind = "transient"
+                        else:
+                            last_error_kind = "unsuitable"
                         log.debug("Эндпоинт %s вернул %s", endpoint, resp.status)
                         return None
 
                     try:
                         data = json.loads(text)
                     except Exception:
+                        last_error = "ответ SD не JSON"
+                        last_error_kind = "unsuitable"
                         log.warning("Эндпоинт %s вернул не JSON: %s...", endpoint, text[:200])
                         return None
 
+                    last_error_kind = "ok"
                     items = self._parse_response(data, endpoint)
                     return items, extract_total(data)
 
@@ -785,6 +808,7 @@ class SDClient:
                 # Без этой ветки наружу уходил голый TimeoutError с пустым
                 # str(), и в автопаузе было "Причина: TimeoutError: ".
                 last_error = "таймаут при чтении ответа SD"
+                last_error_kind = "transient"
                 log.warning(
                     "Таймаут при запросе %s (страница %d) — пропускаю страницу",
                     endpoint,
@@ -792,14 +816,36 @@ class SDClient:
                 )
                 return None
             except aiohttp.ClientError as e:
-                last_error = str(e)
+                last_error = str(e) or type(e).__name__
+                last_error_kind = "transient"
                 log.debug("Ошибка запроса к %s: %s", endpoint, e)
                 return None
 
         for endpoint, default_params in endpoints:
+            is_working = endpoint == self._working_endpoint
             first = await _fetch_page(endpoint, default_params, 1)
             if first is None:
-                continue
+                kind = last_error_kind
+                if kind == "auth":
+                    raise RuntimeError(last_error or "сессия SD истекла")
+                if kind == "transient":
+                    if is_working:
+                        log.warning(
+                            "Рабочий эндпоинт %s не ответил (%s) — повтор через %.1f с",
+                            endpoint,
+                            last_error,
+                            TRANSIENT_RETRY_DELAY,
+                        )
+                        await asyncio.sleep(TRANSIENT_RETRY_DELAY)
+                        first = await _fetch_page(endpoint, default_params, 1)
+                        if first is None:
+                            raise RuntimeError(
+                                last_error or "таймаут при чтении ответа SD")
+                    else:
+                        last_transient_error = last_error
+                        continue
+                else:
+                    continue
 
             items, total = first
             self._working_endpoint = endpoint
@@ -825,7 +871,25 @@ class SDClient:
                 page_number += 1
                 nxt = await _fetch_page(endpoint, default_params, page_number)
                 if not nxt or not nxt[0]:
-                    break
+                    if last_error_kind == "auth":
+                        raise RuntimeError(last_error or "сессия SD истекла")
+                    if last_error_kind == "transient":
+                        log.warning(
+                            "Страница %d не загрузилась (%s) — повтор через %.1f с",
+                            page_number,
+                            last_error,
+                            TRANSIENT_RETRY_DELAY,
+                        )
+                        await asyncio.sleep(TRANSIENT_RETRY_DELAY)
+                        nxt = await _fetch_page(endpoint, default_params, page_number)
+                    if not nxt or not nxt[0]:
+                        if last_error_kind == "transient":
+                            warning = (
+                                f"страница {page_number} не загружена: {last_error}"
+                            )
+                            self.last_fetch_warnings.append(warning)
+                            log.warning("%s", warning)
+                        break
                 fresh = [req for req in nxt[0] if req.sys_id not in seen_sys_ids]
                 if not fresh:
                     # Сервер не умеет листать — не долбим его каждую минуту
@@ -853,6 +917,8 @@ class SDClient:
                 log.info("После дедупликации заявок: %d", len(result))
             return result, total
 
+        if last_transient_error:
+            raise RuntimeError(last_transient_error)
         raise RuntimeError(f"Все эндпоинты вернули ошибку. Последняя: {last_error}")
 
     def _parse_response(self, data: dict, endpoint: str) -> list[SDRequest]:
