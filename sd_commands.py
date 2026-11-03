@@ -338,10 +338,14 @@ def register_sd_commands(
         if total and total > len(items):
             header += f" (всего по фильтру {total}, показаны первые {len(items)})"
 
-        lines = [header, ""]
-        lines.extend(item.format_short(index) for index, item in enumerate(items, 1))
+        blocks = [header]
+        for index, item in enumerate(items, 1):
+            blocks.append(item.format_short(index))
 
-        for chunk in split_message("\n".join(lines)):
+        # Склеиваем блоки через ДВЕ пустые строки для читаемости
+        text = "\n\n".join(blocks)
+
+        for chunk in split_message(text):
             await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
     @dp.message(Command("sd_today"))
