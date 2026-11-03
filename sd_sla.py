@@ -54,12 +54,17 @@ def now_in(tz_name: str) -> datetime:
 
 
 def localize(value: datetime | None, tz_name: str) -> datetime | None:
-    """Привязывает время из SD (приходит без зоны) к часовому поясу SD."""
+    """Переводит время из SD в часовой пояс SD.
+
+    SimpleOne отдаёт время в UTC без зоны, поэтому наивное значение сначала
+    помечается как UTC и только потом переводится в ``tz_name``. Раньше зона
+    просто «приклеивалась» (replace), из-за чего дедлайн уезжал на 3 часа.
+    """
     if value is None:
         return None
     tz = resolve_timezone(tz_name)
     if value.tzinfo is None:
-        return value.replace(tzinfo=tz)
+        value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(tz)
 
 

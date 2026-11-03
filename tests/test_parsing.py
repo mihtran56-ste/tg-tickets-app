@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +24,7 @@ from sd_client import (  # noqa: E402
     parse_sd_datetime,
     unwrap_value,
 )
+from sd_sla import localize, resolve_timezone  # noqa: E402
 
 # Так реально выглядит запись из /v1/list/itsm_request
 RAW_ITEM = {
@@ -110,8 +111,8 @@ def scenario_parse_item() -> None:
     assert request.assigned_user == "Игорь Храмов (Khramov.IK)", f"исполнитель: {request.assigned_user}"
     assert request.state == "В работе", f"статус: {request.state!r}"
     assert request.planning_state == "Запланирована", f"планирование: {request.planning_state!r}"
-    assert request.sys_created_at == "31.10.2026 14:29", f"дата создания: {request.sys_created_at!r}"
-    assert request.multicard_deadline == "01.11.2026 10:40", f"дедлайн: {request.multicard_deadline!r}"
+    assert request.sys_created_at == "31.10.2026 17:29", f"дата создания: {request.sys_created_at!r}"
+    assert request.multicard_deadline == "01.11.2026 13:40", f"дедлайн: {request.multicard_deadline!r}"
     assert request.deadline_at == datetime(2026, 11, 1, 10, 40, 53), (
         f"дедлайн для SLA: {request.deadline_at!r}"
     )
@@ -142,6 +143,39 @@ def scenario_epoch_deadline() -> None:
     print("  OK: дедлайн-заглушка 1970 считается отсутствующей")
 
 
+def scenario_utc_deadline() -> None:
+    """API отдаёт UTC: в уведомлении время должно быть уже московским."""
+    client = make_client()
+    item = dict(RAW_ITEM)
+    item["sys_created_at"] = {"value": "2026-11-02 15:10:57"}
+    item["multicard_deadline"] = {"value": "2026-11-03 14:52:21"}
+
+    request = client._parse_item(item)
+    assert request is not None
+
+    assert request.multicard_deadline == "03.11.2026 17:52", (
+        f"дедлайн для показа: {request.multicard_deadline!r}"
+    )
+    assert request.sys_created_at == "02.11.2026 18:10", (
+        f"дата создания для показа: {request.sys_created_at!r}"
+    )
+    # Для SLA и ключа дедлайна храним исходный naive UTC.
+    assert request.deadline_at == datetime(2026, 11, 3, 14, 52, 21), (
+        f"дедлайн для SLA: {request.deadline_at!r}"
+    )
+
+    tz = resolve_timezone("Europe/Moscow")
+    localized = localize(request.deadline_at, "Europe/Moscow")
+    assert localized == datetime(2026, 11, 3, 17, 52, 21, tzinfo=tz), (
+        f"localize: {localized!r}"
+    )
+
+    text = request.with_base_url("https://sd.servionica.ru").format_notification()
+    assert "03.11.2026 17:52" in text, f"в уведомлении не московское время:\n{text}"
+    assert "14:52" not in text, f"в уведомлении осталось UTC:\n{text}"
+    print("  OK: UTC из API переводится в московское время для показа и SLA")
+
+
 def scenario_notification() -> None:
     client = make_client()
     request = client._parse_item(RAW_ITEM).with_base_url("https://sd.servionica.ru")
@@ -154,7 +188,7 @@ def scenario_notification() -> None:
     assert "REQ4308671" not in text, f"REQ-номер не нужен в уведомлении:\n{text}"
     assert "<b>Статус:</b> В работе" in text, f"статус не человеческий:\n{text}"
     assert "<b>Планирование:</b> Запланирована" in text, f"планирование не человеческое:\n{text}"
-    assert "31.10.2026 14:29" in text, f"дата не отформатирована:\n{text}"
+    assert "31.10.2026 17:29" in text, f"дата не отформатирована:\n{text}"
     assert 'href="https://sd.servionica.ru/record/itsm_request/' in text, "ссылка должна вести на /record/"
     print("  OK: заголовок — только код SUTSPROD, без REQ")
 
@@ -189,6 +223,7 @@ def main() -> None:
         ("[дедлайн для SLA]", scenario_deadline_parse),
         ("[дедлайн-заглушка 1970]", scenario_epoch_deadline),
         ("[разбор записи]", scenario_parse_item),
+        ("[UTC -> Москва]", scenario_utc_deadline),
         ("[текст уведомления]", scenario_notification),
         ("[код в теме]", scenario_code_detection),
         ("[без кода]", scenario_notification_without_code),

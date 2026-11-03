@@ -21,6 +21,7 @@ from sd_sla import (  # noqa: E402
     format_digest,
     format_sla_notification,
     human_left,
+    localize,
     resolve_timezone,
     sla_stage,
     today_blocks,
@@ -174,8 +175,8 @@ def scenario_today_report() -> None:
 def scenario_today_timezone() -> None:
     """23:30 UTC — это уже 02:30 следующего дня в Москве."""
     now_utc = datetime(2026, 11, 1, 23, 30, tzinfo=timezone.utc)
-    in_msk_today = make_req(20, datetime(2026, 11, 2, 3, 0))
-    yesterday_msk = make_req(21, datetime(2026, 11, 1, 23, 0))
+    in_msk_today = make_req(20, at(day=2, hour=3))
+    yesterday_msk = make_req(21, at(day=1, hour=23))
 
     blocks = today_blocks([in_msk_today, yesterday_msk], now_utc, "Europe/Moscow")
     text = "\n\n".join(blocks)
@@ -183,6 +184,17 @@ def scenario_today_timezone() -> None:
     assert "02.11.2026 — 1" in text, f"граница суток не в поясе SD:\n{text}"
     assert "REQ4300020" in text and "REQ4300021" not in text
     print("  OK: «сегодня» считается по часовому поясу SD, а не сервера")
+
+
+def scenario_localize_utc() -> None:
+    """Наивное время из API — это UTC, его нельзя «приклеивать» к Москве."""
+    naive = datetime(2026, 11, 3, 14, 52, 21)
+    aware_utc = datetime(2026, 11, 3, 14, 52, 21, tzinfo=timezone.utc)
+    expected = datetime(2026, 11, 3, 17, 52, 21, tzinfo=resolve_timezone("Europe/Moscow"))
+
+    assert localize(naive, "Europe/Moscow") == expected, "naive UTC не переведён"
+    assert localize(aware_utc, "Europe/Moscow") == expected, "aware UTC не переведён"
+    print("  OK: naive/aware UTC переводятся в московское время")
 
 
 def scenario_digest() -> None:
@@ -237,6 +249,7 @@ def main() -> None:
         ("[отчёт «сегодня»]", scenario_today_report),
         ("[дайджест]", scenario_digest),
         ("[пояс SD в отчёте]", scenario_today_timezone),
+        ("[UTC -> Москва]", scenario_localize_utc),
         ("[пустой отчёт]", scenario_empty_today),
         ("[неизвестная зона]", scenario_bad_timezone),
     ):

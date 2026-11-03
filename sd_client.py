@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -103,14 +103,25 @@ def unwrap_value(value: object, default: str = "") -> str:
     return default
 
 
-def format_sd_datetime(value: str, default: str = "") -> str:
+def format_sd_datetime(
+    value: str, default: str = "", tz_name: str | None = None
+) -> str:
     """Превращает «2026-10-31 14:29:41» в «31.10.2026 14:29».
 
+    SimpleOne отдаёт API-время в UTC без зоны. Если передан ``tz_name``,
+    значения форматов ``%Y-%m-%d...`` переводятся из UTC в этот пояс.
+    Строки ``%d.%m.%Y`` считаются уже локальными для показа и не трогаются.
     Если формат незнакомый — возвращает исходную строку, чтобы не терять данные.
     """
     text = (value or "").strip()
     if not text:
         return default
+
+    tz = None
+    if tz_name:
+        from sd_sla import resolve_timezone
+
+        tz = resolve_timezone(tz_name)
 
     for source, target in (
         ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M"),
@@ -118,9 +129,12 @@ def format_sd_datetime(value: str, default: str = "") -> str:
         ("%Y-%m-%d", "%d.%m.%Y"),
     ):
         try:
-            return datetime.strptime(text, source).strftime(target)
+            parsed = datetime.strptime(text, source)
         except ValueError:
             continue
+        if tz is not None and source.startswith("%Y-%m-%d"):
+            parsed = parsed.replace(tzinfo=timezone.utc).astimezone(tz)
+        return parsed.strftime(target)
     return text
 
 
@@ -153,9 +167,13 @@ def parse_sd_datetime(value: str) -> datetime | None:
 MIN_REAL_DEADLINE_YEAR = 2000
 
 
-def normalize_deadline(value: str) -> tuple[str | None, datetime | None]:
+def normalize_deadline(
+    value: str, tz_name: str | None = None
+) -> tuple[str | None, datetime | None]:
     """Возвращает дедлайн для показа и для расчёта SLA.
 
+    Показ переводится в ``tz_name`` (SD отдаёт UTC), а ``deadline_at``
+    остаётся наивным UTC — по нему считается SLA и строится ключ дедлайна.
     SimpleOne отдаёт «01.01.1970 00:00», когда дедлайна нет. Это не срок:
     иначе SLA пришлёт ложную просрочку, а в уведомлении появится 1970 год.
     """
@@ -166,7 +184,7 @@ def normalize_deadline(value: str) -> tuple[str | None, datetime | None]:
     parsed = parse_sd_datetime(text)
     if parsed is None or parsed.year < MIN_REAL_DEADLINE_YEAR:
         return None, None
-    return format_sd_datetime(text) or None, parsed
+    return format_sd_datetime(text, tz_name=tz_name) or None, parsed
 
 
 def redact_secrets(text: str) -> str:
@@ -870,7 +888,11 @@ class SDClient:
             return unwrap_value(item.get(key), default)
 
         def get_date(key: str, default: str = "") -> str:
-            return format_sd_datetime(unwrap_value(item.get(key), default), default)
+            return format_sd_datetime(
+                unwrap_value(item.get(key), default),
+                default,
+                tz_name=self.cfg.sd_timezone,
+            )
 
         sys_id = item.get("sys_id", "")
         number = get_val("number")
@@ -878,7 +900,8 @@ class SDClient:
             return None
 
         deadline_display, deadline_at = normalize_deadline(
-            unwrap_value(item.get("multicard_deadline"))
+            unwrap_value(item.get("multicard_deadline")),
+            tz_name=self.cfg.sd_timezone,
         )
 
         return SDRequest(

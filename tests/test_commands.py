@@ -404,9 +404,9 @@ async def scenario_sd_today() -> None:
 
     try:
         items = [
-            make_deadline_request(1, datetime(2026, 11, 1, 18, 0)),
-            make_deadline_request(2, datetime(2026, 11, 1, 10, 0)),
-            make_deadline_request(3, datetime(2026, 11, 2, 9, 0)),
+            make_deadline_request(1, datetime(2026, 11, 1, 18, 0, tzinfo=tz)),
+            make_deadline_request(2, datetime(2026, 11, 1, 10, 0, tzinfo=tz)),
+            make_deadline_request(3, datetime(2026, 11, 2, 9, 0, tzinfo=tz)),
         ]
         watcher = FakeWatcher()
         watcher.client = FakeClient(items=items, total=3)
