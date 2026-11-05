@@ -168,7 +168,7 @@ MIN_REAL_DEADLINE_YEAR = 2000
 
 # Пауза перед повтором GET при таймауте. Логин не повторяем, чтобы не
 # создавать серию неудачных входов в SD.
-TRANSIENT_RETRY_DELAY = 2.0
+TRANSIENT_RETRY_DELAY = 5.0
 
 
 def normalize_deadline(
@@ -416,11 +416,10 @@ class SDClient:
 
     async def _ensure_session(self) -> None:
         if self.session is None or self.session.closed:
-            # total=60 — весь запрос; sock_read=45 — чтение одного блока тела.
-            # Страница 2 в ServiceDesk иногда «досчитывается» на сервере дольше
-            # 30 секунд: при total=30 resp.text() падал по таймауту, и в
-            # уведомлении об автопаузе появлялось "TimeoutError: " без причины.
-            timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
+            # total=90 — весь запрос; sock_read=75 — чтение одного блока тела.
+            # SD иногда «залипает» волнами на 2–4 минуты; 40/45 секунд не
+            # перекрывали это, поэтому ждём дольше.
+            timeout = aiohttp.ClientTimeout(total=90, connect=10, sock_read=75)
             # Проверка сертификата обязательна: через это соединение уходят
             # логин и пароль. Отключать можно только при явной необходимости
             # (SD_VERIFY_SSL=false), например при самоподписанном сертификате.

@@ -160,7 +160,7 @@ def scenario_ok(tmp: Path) -> None:
         assert cfg.sd_check_interval == 10, "минимум интервала не применён"
         assert cfg.llm_api_key == "", "LLM по умолчанию выключен"
         assert cfg.sd_auth_method == "simpleone", f"метод входа по умолчанию: {cfg.sd_auth_method}"
-        assert cfg.sd_max_failures == 2, f"порог неудач по умолчанию: {cfg.sd_max_failures}"
+        assert cfg.sd_max_failures == 5, f"порог неудач по умолчанию: {cfg.sd_max_failures}"
         assert cfg.sd_proxy_port == 0, f"SD-прокси по умолчанию выключен: {cfg.sd_proxy_port}"
         assert cfg.sd_pause_notify is True, "уведомление об автопаузе должно быть включено"
         assert cfg.sd_sla_enabled is True, "SLA-контроль должен быть включён по умолчанию"

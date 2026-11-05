@@ -44,8 +44,8 @@ _RESPONSE_ALLOW = {
     "content-disposition",
 }
 
-# Меньше, чем ClientTimeout(total=60, sock_read=45) у бота.
-_UPSTREAM_TIMEOUT = 40
+# Меньше, чем ClientTimeout(total=90, sock_read=75) у бота.
+_UPSTREAM_TIMEOUT = 70
 
 
 class SDProxy:

@@ -47,7 +47,7 @@ class Config:
     # Авторизация в SD: один метод в бою, чтобы не плодить неудачные логины
     sd_auth_method: str = "simpleone"
     # После скольких неудачных проверок подряд — автопауза мониторинга
-    sd_max_failures: int = 2
+    sd_max_failures: int = 5
     sd_pause_notify: bool = True
     # SLA: предупреждение за N часов до дедлайна СУТС и сообщение о просрочке
     sd_sla_enabled: bool = True
@@ -210,7 +210,7 @@ def load_config() -> Config:
         sd_seed_on_first_run=_bool_env("SD_SEED_ON_FIRST_RUN", True),
         sd_verify_ssl=_bool_env("SD_VERIFY_SSL", True),
         sd_auth_method=sd_auth_method,
-        sd_max_failures=_int_env("SD_MAX_FAILURES", 2, 1),
+        sd_max_failures=_int_env("SD_MAX_FAILURES", 5, 1),
         sd_pause_notify=_bool_env("SD_PAUSE_NOTIFY", True),
         sd_sla_enabled=_bool_env("SD_SLA_ENABLED", True),
         sd_sla_warn_hours=_float_env("SD_SLA_WARN_HOURS", 2.0, 0.0, 72.0),
