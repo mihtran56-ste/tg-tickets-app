@@ -276,6 +276,38 @@ def scenario_timeout_reason() -> None:
     print("  OK: причина таймаута различается по этапу (connect/headers/body)")
 
 
+def scenario_relay_base() -> None:
+    """Внешний релей главнее локального прокси, а urljoin не съедает префикс.
+
+    Адрес функции Yandex — https://functions.yandexcloud.net/<id>. Если собрать
+    запрос через urljoin, абсолютный путь «/v1/...» выбросит <id>, и запрос
+    уйдёт «в никуда».
+    """
+    relay = SDClient(
+        make_client_cfg(
+            sd_proxy_url="https://functions.yandexcloud.net/fn123",
+            sd_proxy_port=8765,
+            sd_proxy_secret="s3cret",
+        )
+    )
+    assert relay._http_base == "https://functions.yandexcloud.net/fn123", relay._http_base
+    assert relay._url("/v1/auth/login") == (
+        "https://functions.yandexcloud.net/fn123/v1/auth/login"
+    ), relay._url("/v1/auth/login")
+    assert relay._url("login.do") == (
+        "https://functions.yandexcloud.net/fn123/login.do"
+    ), relay._url("login.do")
+    assert relay._session_headers().get("X-Relay-Secret") == "s3cret"
+
+    local = SDClient(make_client_cfg(sd_proxy_port=8765))
+    assert local._http_base == "http://127.0.0.1:8765", local._http_base
+    assert "X-Relay-Secret" not in local._session_headers(), "секрет ушёл без релея"
+
+    direct = SDClient(make_client_cfg())
+    assert direct._http_base == "https://sd.example.ru", direct._http_base
+    print("  OK: релей главнее локального прокси, префикс функции сохраняется")
+
+
 async def main() -> None:
     print("Проверка клиента ServiceDesk")
     for title, scenario in (
@@ -301,6 +333,8 @@ async def main() -> None:
     await scenario_one_relogin_per_fetch()
     print("\n[причина таймаута по этапу]")
     scenario_timeout_reason()
+    print("\n[внешний релей]")
+    scenario_relay_base()
     print("\nВсе проверки пройдены.")
 
 

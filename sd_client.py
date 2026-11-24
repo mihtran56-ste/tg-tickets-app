@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
 
 import aiohttp
 
@@ -165,6 +164,11 @@ def parse_sd_datetime(value: str) -> datetime | None:
 
 
 MIN_REAL_DEADLINE_YEAR = 2000
+
+# Заголовок с секретом внешнего посредника (Yandex Cloud Function).
+# Сам посредник публичный, поэтому без секрета его адрес смог бы
+# использовать кто угодно.
+RELAY_SECRET_HEADER = "X-Relay-Secret"
 
 # Паузы перед повторами GET при таймауте. Логин не повторяем, чтобы не
 # создавать серию неудачных входов в SD.
@@ -408,11 +412,15 @@ class SDClient:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.base_url = cfg.sd_base_url.rstrip("/")
-        # HTTP-запросы идут через локальный reverse-proxy, если он включён;
-        # base_url остаётся настоящим — из него строятся ссылки на заявки.
+        # HTTP-запросы идут через посредника, если он включён; base_url
+        # остаётся настоящим — из него строятся ссылки на заявки.
+        # Приоритет: внешний релей (SD_PROXY_URL) → локальный прокси → прямой.
         self._http_base = self.base_url
-        if cfg.sd_proxy_port:
+        if cfg.sd_proxy_url:
+            self._http_base = cfg.sd_proxy_url
+        elif cfg.sd_proxy_port:
             self._http_base = f"http://127.0.0.1:{cfg.sd_proxy_port}"
+        self._relay_secret = cfg.sd_proxy_secret
         self._login = cfg.sd_login
         self._password = cfg.sd_password
         self._verify_ssl = cfg.sd_verify_ssl
@@ -438,6 +446,26 @@ class SDClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.close()
 
+    def _url(self, path: str) -> str:
+        """Полный URL запроса к SD или к внешнему посреднику.
+
+        urljoin здесь не годится: путь запроса абсолютный («/v1/...»), и он
+        выбросил бы префикс функции Yandex
+        (https://functions.yandexcloud.net/<id>).
+        """
+        return f"{self._http_base}{path if path.startswith('/') else '/' + path}"
+
+    def _session_headers(self) -> dict[str, str]:
+        """Заголовки всех запросов к SD (или к внешнему релею)."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if self._relay_secret:
+            headers[RELAY_SECRET_HEADER] = self._relay_secret
+        return headers
+
     async def _ensure_session(self) -> None:
         if self.session is None or self.session.closed:
             # total=45 — весь запрос; sock_read=40 — чтение одного блока тела.
@@ -453,11 +481,7 @@ class SDClient:
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+                headers=self._session_headers(),
             )
 
     async def close(self) -> None:
@@ -532,7 +556,7 @@ class SDClient:
     async def _login_via_api_json(self) -> tuple[bool, str]:
         """JSON API авторизация: /api/now/auth/login (ServiceNow style)."""
         assert self.session is not None
-        auth_url = urljoin(self._http_base, "/api/now/auth/login")
+        auth_url = self._url("/api/now/auth/login")
         async with self.session.post(auth_url, json={"username": self._login, "password": self._password}) as resp:
             log.info("POST %s -> HTTP %s", auth_url, resp.status)
             if resp.status == 401:
@@ -549,7 +573,7 @@ class SDClient:
     async def _login_via_simpleone_api(self) -> tuple[bool, str]:
         """SimpleOne API авторизация: /v1/auth/login."""
         assert self.session is not None
-        auth_url = urljoin(self._http_base, "/v1/auth/login")
+        auth_url = self._url("/v1/auth/login")
         payload = {"username": self._login, "password": self._password}
 
         async with self.session.post(auth_url, json=payload) as resp:
@@ -574,7 +598,7 @@ class SDClient:
     async def _login_via_auth_do(self) -> tuple[bool, str]:
         """Альтернативный эндпоинт: /auth.do."""
         assert self.session is not None
-        auth_url = urljoin(self._http_base, "/auth.do")
+        auth_url = self._url("/auth.do")
         payload = {
             "user_name": self._login,
             "user_password": self._password,
@@ -598,7 +622,7 @@ class SDClient:
         assert self.session is not None
 
         # 1. Получаем страницу логина
-        login_page_url = urljoin(self._http_base, "/login.do")
+        login_page_url = self._url("/login.do")
         async with self.session.get(login_page_url) as resp:
             log.info("GET %s -> HTTP %s", login_page_url, resp.status)
             if resp.status == 401:
@@ -631,7 +655,7 @@ class SDClient:
             return False, "форма логина не найдена"
 
         # 2. POST логин на правильный URL
-        login_url = urljoin(self._http_base, form_action)
+        login_url = self._url(form_action)
         payload = {
             "user_name": self._login,
             "user_password": self._password,
@@ -668,7 +692,7 @@ class SDClient:
     async def _login_via_get_params(self) -> tuple[bool, str]:
         """GET с параметрами: /login.do?user_name=...&user_password=..."""
         assert self.session is not None
-        auth_url = urljoin(self._http_base, "/login.do")
+        auth_url = self._url("/login.do")
         params = {
             "user_name": self._login,
             "user_password": self._password,
@@ -784,7 +808,7 @@ class SDClient:
             """
             nonlocal last_error, last_error_kind
             last_error_kind = "unknown"
-            url = urljoin(self._http_base, endpoint)
+            url = self._url(endpoint)
             params = dict(default_params)
             if view:
                 params["sysparm_view"] = view

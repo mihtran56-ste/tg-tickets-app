@@ -1,0 +1,31 @@
+openapi: 3.0.0
+info:
+  title: sd-relay
+  version: 1.0.0
+  description: Прокси в ServiceDesk для бота TG_Tickets
+
+# Только GET и POST — ровно то, что делает бот: логин POST-ом, списки GET-ом.
+# Остальные методы объявлять не нужно (шлюз ответит 405), а put/delete он
+# отказывается принимать в спецификации.
+#
+# Подставьте свои значения: function_id и service_account_id.
+paths:
+  /{proxy+}:
+    parameters:
+      - name: proxy
+        in: path
+        required: false
+        schema:
+          type: string
+    get:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: <function-id>
+        tag: $latest
+        service_account_id: <service-account-id>
+    post:
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: <function-id>
+        tag: $latest
+        service_account_id: <service-account-id>

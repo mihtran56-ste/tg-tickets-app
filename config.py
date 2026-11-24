@@ -39,6 +39,10 @@ class Config:
     sd_password: str = ""
     sd_check_interval: int = 60
     sd_proxy_port: int = 0
+    # Внешний посредник (реверс-прокси) в РФ: используется, когда с хостинга
+    # соединение с SD обрывается на этапе connect. Пусто — прямой доступ.
+    sd_proxy_url: str = ""
+    sd_proxy_secret: str = ""
     sd_notify_chat_ids: frozenset[int] = frozenset()
     sd_view: str = "Default"
     sd_condition: str = ""
@@ -204,6 +208,8 @@ def load_config() -> Config:
         sd_password=_env("SD_PASSWORD"),
         sd_check_interval=_int_env("SD_CHECK_INTERVAL", 60, 10),
         sd_proxy_port=_int_env("SD_PROXY_PORT", 0, 0),
+        sd_proxy_url=_env("SD_PROXY_URL").rstrip("/"),
+        sd_proxy_secret=_env("SD_PROXY_SECRET"),
         sd_notify_chat_ids=_parse_ids(_env("SD_NOTIFY_CHAT_IDS")),
         sd_view=_env("SD_VIEW", "Default"),
         sd_condition=_env("SD_CONDITION"),
