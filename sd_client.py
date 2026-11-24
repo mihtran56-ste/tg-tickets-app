@@ -166,9 +166,33 @@ def parse_sd_datetime(value: str) -> datetime | None:
 
 MIN_REAL_DEADLINE_YEAR = 2000
 
-# Пауза перед повтором GET при таймауте. Логин не повторяем, чтобы не
+# Паузы перед повторами GET при таймауте. Логин не повторяем, чтобы не
 # создавать серию неудачных входов в SD.
-TRANSIENT_RETRY_DELAY = 5.0
+# Почему повторов стало больше одного: с хостинга часть запросов к SD виснет
+# наглухо, а следующий проходит за 2 секунды (замерено 24.11.2026: 1,7 с
+# против таймаута на том же URL). Дешевле повторить, чем ждать 70 с и упасть.
+TRANSIENT_RETRY_DELAYS = (2.0, 5.0)
+
+# Сколько эндпоинтов разрешено «перебрать» на одних таймаутах. Раньше на
+# таймауте проверялись все 7 подряд — это до 7 × таймаут на один цикл.
+MAX_TRANSIENT_ENDPOINTS = 2
+
+
+def timeout_reason(detail: str) -> str:
+    """Человеческая причина таймаута по фазе из ответа SD-прокси.
+
+    Прокси отвечает 504 и пишет в тело этап: «connect», «send», «headers»
+    или «body». По нему видно, где вязнет: в сети/фильтре по IP или
+    на стороне самого ServiceDesk.
+    """
+    lowered = (detail or "").lower()
+    if "connect" in lowered:
+        return "таймаут подключения к SD (сеть или фильтр по IP)"
+    if "send" in lowered or "headers" in lowered:
+        return "SD принял запрос, но не ответил (нагрузка сервиса)"
+    if "body" in lowered:
+        return "SD начал отвечать, но не дослал данные (нагрузка сервиса)"
+    return "таймаут при чтении ответа SD"
 
 
 def normalize_deadline(
@@ -416,10 +440,12 @@ class SDClient:
 
     async def _ensure_session(self) -> None:
         if self.session is None or self.session.closed:
-            # total=90 — весь запрос; sock_read=75 — чтение одного блока тела.
-            # SD иногда «залипает» волнами на 2–4 минуты; 40/45 секунд не
-            # перекрывали это, поэтому ждём дольше.
-            timeout = aiohttp.ClientTimeout(total=90, connect=10, sock_read=75)
+            # total=45 — весь запрос; sock_read=40 — чтение одного блока тела.
+            # Прокси сдаётся на 35 с (_UPSTREAM_TIMEOUT), поэтому таймаут бота
+            # больше него: сначала отвечает прокси, поток не остаётся висеть.
+            # Зависший запрос теперь не ждём 70 с: короткий таймаут + повторы
+            # дают шанс попасть на «живой» ответ за пару секунд.
+            timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=40)
             # Проверка сертификата обязательна: через это соединение уходят
             # логин и пароль. Отключать можно только при явной необходимости
             # (SD_VERIFY_SSL=false), например при самоподписанном сертификате.
@@ -796,8 +822,9 @@ class SDClient:
                     if resp.status != 200:
                         last_error = f"HTTP {resp.status}"
                         if resp.status == 504:
-                            # Прокси отдаёт 504, когда SD не ответил за свой таймаут.
-                            last_error = "таймаут при чтении ответа SD"
+                            # Прокси отдаёт 504, когда SD не ответил за свой
+                            # таймаут. В теле — этап, на котором вязнет.
+                            last_error = timeout_reason(text)
                             last_error_kind = "transient"
                         elif resp.status >= 500 or resp.status == 429:
                             last_error_kind = "transient"
@@ -837,31 +864,72 @@ class SDClient:
                 log.debug("Ошибка запроса к %s: %s", endpoint, e)
                 return None
 
+        async def _fetch_page_retrying(
+            endpoint: str,
+            default_params: dict,
+            page_number: int,
+        ) -> tuple[list[SDRequest], int] | None:
+            """Страница с повторами: зависший запрос дешевле повторить.
+
+            Возвращает None, если страницу не удалось получить ни с одной
+            попытки. Первый этап «эндпоинт не подошёл» (404, HTML) не
+            повторяется: повтор имеет смысл только для таймаутов и 5xx.
+            """
+            nonlocal last_error, last_error_kind
+            attempts = 1 + len(TRANSIENT_RETRY_DELAYS)
+            for attempt in range(1, attempts + 1):
+                started = time.monotonic()
+                result = await _fetch_page(endpoint, default_params, page_number)
+                elapsed = time.monotonic() - started
+                if result is not None:
+                    log.info(
+                        "Страница %d получена за %.1f с (попытка %d/%d)",
+                        page_number,
+                        elapsed,
+                        attempt,
+                        attempts,
+                    )
+                    return result
+                if last_error_kind != "transient" or attempt == attempts:
+                    return None
+                delay = TRANSIENT_RETRY_DELAYS[attempt - 1]
+                log.warning(
+                    "Страница %d не ответила (%s) за %.1f с — попытка %d/%d, "
+                    "повтор через %.0f с",
+                    page_number,
+                    last_error,
+                    elapsed,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            return None
+
+        consecutive_transient = 0
+
         for endpoint, default_params in endpoints:
             is_working = endpoint == self._working_endpoint
-            first = await _fetch_page(endpoint, default_params, 1)
+            first = await _fetch_page_retrying(endpoint, default_params, 1)
             if first is None:
                 kind = last_error_kind
                 if kind == "auth":
                     raise RuntimeError(last_error or "сессия SD истекла")
                 if kind == "transient":
-                    if is_working:
-                        log.warning(
-                            "Рабочий эндпоинт %s не ответил (%s) — повтор через %.1f с",
-                            endpoint,
-                            last_error,
-                            TRANSIENT_RETRY_DELAY,
-                        )
-                        await asyncio.sleep(TRANSIENT_RETRY_DELAY)
-                        first = await _fetch_page(endpoint, default_params, 1)
-                        if first is None:
-                            raise RuntimeError(
-                                last_error or "таймаут при чтении ответа SD")
-                    else:
-                        last_transient_error = last_error
-                        continue
-                else:
+                    consecutive_transient += 1
+                    last_transient_error = last_error
+                    # Рабочий эндпоинт не отвечает — перебирать чужие API
+                    # бессмысленно: это добавляет к циклу по таймауту на каждый.
+                    if is_working or consecutive_transient >= MAX_TRANSIENT_ENDPOINTS:
+                        raise RuntimeError(
+                            last_error or "таймаут при чтении ответа SD")
+                    log.warning(
+                        "Эндпоинт %s не ответил (%s) — пробую следующий",
+                        endpoint,
+                        last_error,
+                    )
                     continue
+                continue
 
             items, total = first
             self._working_endpoint = endpoint
@@ -885,27 +953,17 @@ class SDClient:
                 and self._pagination_supported is not False
             ):
                 page_number += 1
-                nxt = await _fetch_page(endpoint, default_params, page_number)
+                nxt = await _fetch_page_retrying(endpoint, default_params, page_number)
                 if not nxt or not nxt[0]:
                     if last_error_kind == "auth":
                         raise RuntimeError(last_error or "сессия SD истекла")
                     if last_error_kind == "transient":
-                        log.warning(
-                            "Страница %d не загрузилась (%s) — повтор через %.1f с",
-                            page_number,
-                            last_error,
-                            TRANSIENT_RETRY_DELAY,
+                        warning = (
+                            f"страница {page_number} не загружена: {last_error}"
                         )
-                        await asyncio.sleep(TRANSIENT_RETRY_DELAY)
-                        nxt = await _fetch_page(endpoint, default_params, page_number)
-                    if not nxt or not nxt[0]:
-                        if last_error_kind == "transient":
-                            warning = (
-                                f"страница {page_number} не загружена: {last_error}"
-                            )
-                            self.last_fetch_warnings.append(warning)
-                            log.warning("%s", warning)
-                        break
+                        self.last_fetch_warnings.append(warning)
+                        log.warning("%s", warning)
+                    break
                 fresh = [req for req in nxt[0] if req.sys_id not in seen_sys_ids]
                 if not fresh:
                     # Сервер не умеет листать — не долбим его каждую минуту

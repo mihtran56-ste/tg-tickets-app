@@ -176,14 +176,14 @@ async def scenario_empty() -> None:
 
 
 async def scenario_working_endpoint_timeout() -> None:
-    """Таймаут рабочего эндпоинта: один повтор и понятная ошибка, без fallback."""
+    """Таймаут рабочего эндпоинта: повторы и понятная ошибка, без fallback."""
     client = make_client()
     client._working_endpoint = "/v1/list/itsm_request"
     session = TimeoutSession({}, timeout_pages={1})
     client.session = session
 
-    original_delay = sd_client_module.TRANSIENT_RETRY_DELAY
-    sd_client_module.TRANSIENT_RETRY_DELAY = 0
+    original_delays = sd_client_module.TRANSIENT_RETRY_DELAYS
+    sd_client_module.TRANSIENT_RETRY_DELAYS = (0.0, 0.0)
     try:
         try:
             await client.fetch_requests(view="Default", condition="x", limit=100)
@@ -192,10 +192,10 @@ async def scenario_working_endpoint_timeout() -> None:
         else:
             raise AssertionError("ожидали RuntimeError при таймауте рабочего эндпоинта")
     finally:
-        sd_client_module.TRANSIENT_RETRY_DELAY = original_delay
+        sd_client_module.TRANSIENT_RETRY_DELAYS = original_delays
 
     pages = [r.get("page") for r in session.requests]
-    assert pages == [1, 1], f"должны быть 1 запрос + 1 повтор, а не {pages}"
+    assert pages == [1, 1, 1], f"должны быть 1 запрос + 2 повтора, а не {pages}"
     print("  OK: таймаут рабочего эндпоинта не уводит в перебор чужих API")
 
 
@@ -207,20 +207,20 @@ async def scenario_page_two_timeout_is_partial() -> None:
     session = TimeoutSession({1: page_payload(first, 28)}, timeout_pages={2})
     client.session = session
 
-    original_delay = sd_client_module.TRANSIENT_RETRY_DELAY
-    sd_client_module.TRANSIENT_RETRY_DELAY = 0
+    original_delays = sd_client_module.TRANSIENT_RETRY_DELAYS
+    sd_client_module.TRANSIENT_RETRY_DELAYS = (0.0, 0.0)
     try:
         items, total = await client.fetch_requests(
             view="Default", condition="x", limit=100
         )
     finally:
-        sd_client_module.TRANSIENT_RETRY_DELAY = original_delay
+        sd_client_module.TRANSIENT_RETRY_DELAYS = original_delays
 
     assert len(items) == 20 and total == 28, f"items={len(items)} total={total}"
     assert client.last_fetch_warnings, "нет предупреждения о странице 2"
     assert "страница 2" in client.last_fetch_warnings[0], client.last_fetch_warnings
     pages = [r.get("page") for r in session.requests]
-    assert pages == [1, 2, 2], f"страница 2 должна быть с одним повтором: {pages}"
+    assert pages == [1, 2, 2, 2], f"страница 2 должна быть с повторами: {pages}"
     print("  OK: таймаут страницы 2 даёт partial-предупреждение, а не тихий успех")
 
 

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from aiohttp import ClientSession  # noqa: E402
+import sd_proxy as sd_proxy_module  # noqa: E402
 from sd_proxy import request_headers, response_headers, start_sd_proxy  # noqa: E402
 
 
@@ -117,6 +118,45 @@ async def scenario_proxy_strips_bad_csp() -> None:
     print("  OK: прокси вернул 200 и тело без битого CSP")
 
 
+async def scenario_upstream_hang_reports_phase() -> None:
+    """Зависший SD: прокси отвечает 504 и говорит, на каком этапе вязнет.
+
+    24.11.2026 в логах было просто «timed out», и нельзя было понять, вязнет
+    соединение (сеть/фильтр по IP) или сервер принял запрос и думает.
+    """
+
+    async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await asyncio.sleep(30)  # не отвечаем — имитация зависшего SD
+        except Exception:  # noqa: BLE001 — соединение закроют с другой стороны
+            pass
+        finally:
+            writer.close()
+
+    upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0)
+    upstream_port = upstream_server.sockets[0].getsockname()[1]
+    proxy_port = free_port()
+    runner = await start_sd_proxy(f"http://127.0.0.1:{upstream_port}", proxy_port)
+    original_timeout = sd_proxy_module._UPSTREAM_TIMEOUT
+    # Таймаут на время теста: реальные 35 с ждать незачем
+    sd_proxy_module._UPSTREAM_TIMEOUT = 0.4
+    try:
+        async with ClientSession() as session:
+            async with session.get(
+                f"http://127.0.0.1:{proxy_port}/v1/list/itsm_request?page=1"
+            ) as response:
+                body = await response.text()
+                assert response.status == 504, f"статус: {response.status}"
+                assert "headers" in body, f"этап не указан в ответе: {body!r}"
+    finally:
+        sd_proxy_module._UPSTREAM_TIMEOUT = original_timeout
+        await runner.cleanup()
+        upstream_server.close()
+        await upstream_server.wait_closed()
+    print("  OK: зависший SD -> 504 с указанием этапа")
+
+
 async def main() -> None:
     print("Проверка SD-прокси")
     print("\n[фильтр заголовков ответа]")
@@ -125,6 +165,8 @@ async def main() -> None:
     scenario_request_headers()
     print("\n[интеграция с битым CSP]")
     await scenario_proxy_strips_bad_csp()
+    print("\n[зависший upstream: этап в 504]")
+    await scenario_upstream_hang_reports_phase()
     print("\nВсе проверки пройдены.")
 
 

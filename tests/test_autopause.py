@@ -437,6 +437,52 @@ async def scenario_notification_text_network() -> None:
     print("  OK: при сбое сети подсказка про доступность SD")
 
 
+async def scenario_slow_check_gets_idle_gap() -> None:
+    """Долгая проверка больше не превращается в цикл встык.
+
+    Было: sleep = max(1, interval - elapsed) — при проверке в 145 с пауза
+    схлопывалась в 1 с, и бот непрерывно висел в очереди к SD.
+    """
+    watcher = make_watcher(FakeBot())
+
+    assert watcher._sleep_after_check(10) == 50, watcher._sleep_after_check(10)
+    slow = watcher._sleep_after_check(145)
+    assert slow == sd_watcher_module.MIN_IDLE_SEC, slow
+    print("  OK: долгая проверка -> пауза MIN_IDLE, а не 1 с")
+
+    watcher._consecutive_failures = 2
+    assert watcher._sleep_after_check(5) == 120, watcher._sleep_after_check(5)
+    watcher._consecutive_failures = 4
+    capped = watcher._sleep_after_check(5)
+    assert capped == sd_watcher_module.MAX_BACKOFF_SEC, capped
+    print("  OK: после серии неудач пауза растёт и упирается в потолок")
+
+    watcher._consecutive_failures = 0
+    assert watcher._sleep_after_check(5) == 55
+    print("  OK: успешная проверка возвращает обычный интервал")
+
+
+async def scenario_check_now_single_flight() -> None:
+    """Пока проверка идёт, /sd_test не отправляет второй запрос в SD."""
+    bot = FakeBot()
+    client = FakeClient()
+    watcher = make_watcher(bot, client)
+
+    original_wait = sd_watcher_module.CHECK_NOW_WAIT_SEC
+    sd_watcher_module.CHECK_NOW_WAIT_SEC = 0.1
+    await watcher._check_lock.acquire()
+    try:
+        result = await watcher.check_now()
+    finally:
+        watcher._check_lock.release()
+        sd_watcher_module.CHECK_NOW_WAIT_SEC = original_wait
+
+    assert client.calls == 0, f"второй запрос в SD: {client.calls}"
+    assert result.warnings, "нет пояснения, что проверка уже идёт"
+    assert not result.errors, result.errors
+    print("  OK: /sd_test не дублирует запрос к SD во время проверки")
+
+
 async def main() -> None:
     print("Проверка автопаузы SD-мониторинга")
     for title, scenario in (
@@ -455,6 +501,8 @@ async def main() -> None:
         ("[2 логина: сеть]", scenario_two_network_failures_two_logins),
         ("[текст: пароль]", scenario_notification_text_auth),
         ("[текст: сеть]", scenario_notification_text_network),
+        ("[пауза после долгой проверки]", scenario_slow_check_gets_idle_gap),
+        ("[одна проверка за раз]", scenario_check_now_single_flight),
     ):
         print(f"\n{title}")
         await scenario()

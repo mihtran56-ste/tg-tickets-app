@@ -31,6 +31,16 @@ from sd_state import SDStateStore
 
 log = logging.getLogger("sd_watcher")
 
+# Минимальная пауза между проверками. Раньше пауза считалась от старта проверки
+# (max(1, interval - elapsed)), и при проверке в 145 с циклы шли встык: бот
+# непрерывно стоял в очереди к SD и каждые 2,5 минуты писал трейсбек в лог.
+MIN_IDLE_SEC = 15
+# Потолок экспоненциального бэкоффа после серии неудач.
+MAX_BACKOFF_SEC = 300
+# Сколько ждать текущую проверку по /sd_test, прежде чем честно сказать,
+# что она ещё идёт. Дольше держать команду в ожидании незачем.
+CHECK_NOW_WAIT_SEC = 25
+
 
 @dataclass
 class WatchResult:
@@ -76,6 +86,10 @@ class SDWatcher:
         # повторно, пока мониторинг уже стоит на паузе из-за сбоев.
         self._consecutive_failures = 0
         self._paused_by_failures = False
+        # Одна проверка SD в единицу времени: цикл и /sd_test не должны
+        # ходить в ServiceDesk одновременно (24.11.2026 так и было —
+        # две проверки в полёте на одной сессии).
+        self._check_lock = asyncio.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -120,6 +134,26 @@ class SDWatcher:
                 pass
         log.info("SD Watcher остановлен")
 
+    def _min_idle(self) -> float:
+        """Минимальная пауза между проверками: не молотим SD встык."""
+        return float(min(MIN_IDLE_SEC, self.cfg.sd_check_interval))
+
+    def _backoff_sec(self) -> float:
+        """Пауза после серии неудач: 60 → 120 → 240 → 300 с.
+
+        Пока SD не отвечает, частые проверки только добавляют зависших
+        запросов — выгоднее реже, но пережить деградацию без ручного /sd_resume.
+        """
+        if not self._consecutive_failures:
+            return 0.0
+        steps = min(self._consecutive_failures - 1, 3)
+        return float(min(MAX_BACKOFF_SEC, self.cfg.sd_check_interval * (2**steps)))
+
+    def _sleep_after_check(self, elapsed: float) -> float:
+        """Сколько спать после проверки, длившейся `elapsed` секунд."""
+        idle = max(self._min_idle(), self.cfg.sd_check_interval - elapsed)
+        return max(idle, self._backoff_sec())
+
     async def _run_loop(self) -> None:
         # Небольшая задержка при старте, чтобы бот успел инициализироваться
         await asyncio.sleep(max(30, self.cfg.sd_check_interval))
@@ -136,7 +170,8 @@ class SDWatcher:
 
             start = time.time()
             try:
-                result = await self._check_once()
+                async with self._check_lock:
+                    result = await self._check_once()
                 self._last_result = result
                 if result.errors:
                     self.state_store.record_error("; ".join(result.errors))
@@ -154,7 +189,12 @@ class SDWatcher:
                     self._on_success()
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {e}"
-                log.exception("Ошибка в цикле SD Watcher")
+                if isinstance(e, (RuntimeError, asyncio.TimeoutError)):
+                    # Штатный сбой SD: трейсбек тут ничего не добавляет,
+                    # только забивает лог на хостинге.
+                    log.warning("Ошибка в цикле SD Watcher: %s", error_msg)
+                else:
+                    log.exception("Ошибка в цикле SD Watcher")
                 self.state_store.record_error(error_msg)
                 self._last_result = WatchResult(
                     checked_at=time.time(),
@@ -164,9 +204,16 @@ class SDWatcher:
                 )
                 await self._on_failure([error_msg])
 
-            # Ждём до следующей проверки
+            # Ждём до следующей проверки: пауза считается от окончания, а не
+            # от начала работы, и при сбоях растёт экспоненциально.
             elapsed = time.time() - start
-            sleep_time = max(1, self.cfg.sd_check_interval - elapsed)
+            sleep_time = self._sleep_after_check(elapsed)
+            if elapsed >= self.cfg.sd_check_interval:
+                log.info(
+                    "Проверка заняла %.0f с — следующая через %.0f с",
+                    elapsed,
+                    sleep_time,
+                )
             await asyncio.sleep(sleep_time)
 
     def _on_success(self) -> None:
@@ -372,7 +419,16 @@ class SDWatcher:
 
         except Exception as e:
             errors.append(f"{type(e).__name__}: {e}")
-            log.exception("Ошибка при проверке SD")
+            if isinstance(e, (RuntimeError, asyncio.TimeoutError)):
+                # Штатный сбой SD (таймаут/неверный пароль): одна строка в лог.
+                # Полный трейсбек писался каждые 2,5 минуты и скрывал суть.
+                log.warning(
+                    "Проверка SD не удалась за %.1f с: %s",
+                    time.time() - start,
+                    errors[-1],
+                )
+            else:
+                log.exception("Ошибка при проверке SD")
 
         duration_ms = int((time.time() - start) * 1000)
         return WatchResult(
@@ -763,7 +819,13 @@ class SDWatcher:
         }
 
     async def check_now(self) -> WatchResult:
-        """Принудительная проверка прямо сейчас (для команды /sd_test)."""
+        """Принудительная проверка прямо сейчас (для команды /sd_test).
+
+        Если проверка уже идёт (цикл или другой вызов), второй запрос в SD
+        не отправляется: ждём текущую не дольше CHECK_NOW_WAIT_SEC. Раньше
+        /sd_test мог идти параллельно с циклом: две проверки на одной сессии
+        удваивали и без того медленную загрузку.
+        """
         if self._paused:
             return WatchResult(
                 checked_at=time.time(),
@@ -772,7 +834,21 @@ class SDWatcher:
                 duration_ms=0,
             )
         log.info("SD Watcher: принудительная проверка")
-        return await self._check_once()
+        try:
+            await asyncio.wait_for(self._check_lock.acquire(), timeout=CHECK_NOW_WAIT_SEC)
+        except asyncio.TimeoutError:
+            log.warning("Проверка уже идёт — второй запрос к SD не отправляю")
+            return WatchResult(
+                checked_at=time.time(),
+                new_requests=[],
+                errors=[],
+                duration_ms=0,
+                warnings=["проверка уже идёт — результат появится на следующем цикле"],
+            )
+        try:
+            return await self._check_once()
+        finally:
+            self._check_lock.release()
 
     def get_recent_notifications(self, limit: int = 10) -> list[str]:
         """Последние уведомлённые заявки (для /sd_last).

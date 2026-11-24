@@ -15,6 +15,7 @@ import gzip
 import http.client
 import logging
 import ssl
+import time
 import zlib
 from urllib.parse import urlsplit
 
@@ -44,8 +45,28 @@ _RESPONSE_ALLOW = {
     "content-disposition",
 }
 
-# Меньше, чем ClientTimeout(total=90, sock_read=75) у бота.
-_UPSTREAM_TIMEOUT = 70
+# Меньше, чем ClientTimeout(total=45, sock_read=40) у бота: прокси должен
+# сдаваться первым, иначе поток остаётся висеть уже после ответа боту.
+# 35 с вместо 70: с Render часть запросов к SD виснет наглухо, и выгоднее
+# быстро оборвать зависший запрос и повторить, чем ждать две минуты.
+_UPSTREAM_TIMEOUT = 35
+
+# Запрос дольше этого — повод написать в лог разбивку по этапам.
+SLOW_REQUEST_SEC = 5.0
+
+
+class UpstreamTimeout(OSError):
+    """Таймаут на конкретном этапе запроса к SD.
+
+    Без разделения по этапам в логе было просто «timed out» — и нельзя было
+    понять, вязнет ли соединение (сеть, фильтр по IP) или сервер принял
+    запрос и думает (нагрузка на стороне SD). Фаза едет дальше в тексте 504,
+    поэтому её видно и в логе бота.
+    """
+
+    def __init__(self, phase: str, detail: str) -> None:
+        super().__init__(detail)
+        self.phase = phase
 
 
 class SDProxy:
@@ -81,16 +102,50 @@ class SDProxy:
         headers: dict[str, str],
         body: bytes,
     ) -> tuple[int, list[tuple[str, str]], bytes]:
-        """Синхронный запрос к SD; вызывается через asyncio.to_thread."""
+        """Синхронный запрос к SD; вызывается через asyncio.to_thread.
+
+        Замеряет этапы (соединение, отправка, заголовки, тело) и логирует
+        медленные ответы. При обрыве поднимает UpstreamTimeout с фазой.
+        """
         target = (self.prefix + path_qs) if self.prefix else path_qs
         connection = self._connection()
+        started = time.monotonic()
+        phase = "connect"
         try:
+            connection.connect()
+            connected = time.monotonic()
+            phase = "send"
             connection.request(method, target, body=body or None, headers=headers)
+            sent = time.monotonic()
+            phase = "headers"
             response = connection.getresponse()
+            headers_at = time.monotonic()
+            phase = "body"
             data = response.read()
+            finished = time.monotonic()
+
+            total = finished - started
+            if total >= SLOW_REQUEST_SEC:
+                log.warning(
+                    "SD proxy: %s %s -> медленно %.1f с "
+                    "(соединение %.1f, отправка %.1f, заголовки %.1f, тело %.1f)",
+                    method,
+                    path_qs,
+                    total,
+                    connected - started,
+                    sent - connected,
+                    headers_at - sent,
+                    finished - headers_at,
+                )
             return response.status, response.getheaders(), data
+        except (TimeoutError, OSError) as exc:
+            waited = time.monotonic() - started
+            raise UpstreamTimeout(
+                phase, f"{exc or type(exc).__name__} через {waited:.1f} с"
+            ) from exc
         finally:
             connection.close()
+
 
 
 def request_headers(headers) -> dict[str, str]:
@@ -141,6 +196,16 @@ async def _handle(request: web.Request) -> web.Response:
             headers,
             body,
         )
+    except UpstreamTimeout as exc:
+        # Фаза едет в теле ответа: по ней sd_client скажет, что именно вязнет.
+        log.warning(
+            "SD proxy: %s %s -> таймаут на этапе «%s»: %s",
+            request.method,
+            request.rel_url,
+            exc.phase,
+            exc,
+        )
+        return web.Response(status=504, text=f"SD proxy timeout: {exc.phase}")
     except (TimeoutError, OSError) as exc:
         log.warning(
             "SD proxy: %s %s -> ошибка транспорта: %s",

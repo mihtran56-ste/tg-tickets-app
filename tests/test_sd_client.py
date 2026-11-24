@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
-from sd_client import SDClient, redact_secrets  # noqa: E402
+from sd_client import SDClient, redact_secrets, timeout_reason  # noqa: E402
 
 KEY = "af152c000d93405646fa5f3213caf48a1483a1cb5bea6b04b840a30c6c151ebe"
 
@@ -255,6 +255,27 @@ async def scenario_ssl_verification() -> None:
         await unverified.close()
 
 
+def scenario_timeout_reason() -> None:
+    """504 от прокси превращается в понятную причину по этапу.
+
+    24.11.2026 в логе было просто «таймаут при чтении ответа SD», и нельзя
+    было отличить «нас режет сеть» от «сервер принял и думает».
+    """
+    cases = {
+        "SD proxy timeout: connect": "подключения",
+        "SD proxy timeout: headers": "принял запрос, но не ответил",
+        "SD proxy timeout: send": "принял запрос, но не ответил",
+        "SD proxy timeout: body": "не дослал данные",
+    }
+    for raw, expected in cases.items():
+        reason = timeout_reason(raw)
+        assert expected in reason, f"{raw!r} -> {reason!r} (ждали «{expected}»)"
+
+    generic = timeout_reason("")
+    assert generic == "таймаут при чтении ответа SD", generic
+    print("  OK: причина таймаута различается по этапу (connect/headers/body)")
+
+
 async def main() -> None:
     print("Проверка клиента ServiceDesk")
     for title, scenario in (
@@ -278,6 +299,8 @@ async def main() -> None:
     await scenario_timeout()
     print("\n[один релогин на вызов]")
     await scenario_one_relogin_per_fetch()
+    print("\n[причина таймаута по этапу]")
+    scenario_timeout_reason()
     print("\nВсе проверки пройдены.")
 
 
